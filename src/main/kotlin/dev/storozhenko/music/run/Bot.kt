@@ -3,22 +3,32 @@ package dev.storozhenko.music.run
 import dev.storozhenko.music.OdesilResponse
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.services.OdesilService
-import dev.storozhenko.music.services.SpotifyService
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlin.time.Duration.Companion.minutes
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
+import org.telegram.telegrambots.meta.api.methods.send.SendChatAction
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage
+import org.telegram.telegrambots.meta.api.methods.ActionType
 import org.telegram.telegrambots.meta.api.objects.MessageEntity
 import org.telegram.telegrambots.meta.api.objects.Update
 import org.telegram.telegrambots.meta.generics.TelegramClient
+import org.telegram.telegrambots.meta.api.methods.send.SendVideo
+import org.telegram.telegrambots.meta.api.objects.InputFile
+import java.io.File
+import java.util.UUID
+import org.jsoup.Jsoup
+import java.io.BufferedReader
+import java.io.InputStreamReader
 
 class Bot(
     private val botName: String,
-    private val spotifyService: SpotifyService,
+    private val ytdlLocation: String,
     private val telegramClient: TelegramClient
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
@@ -32,13 +42,21 @@ class Bot(
         .split("\n")
         .map { line -> line.split(" ") }
         .associate { (id, prefix) -> id.toLong() to prefix }
+    private val fileDeleteScope = CoroutineScope(Dispatchers.Default)
+    private val processorScope = CoroutineScope(Dispatchers.Default)
 
     override fun consume(updates: MutableList<Update>) {
         logger.info("Got ${updates.size} updates")
         updates.forEach {
-            runCatching { consume(it) }
-                .onFailure { e -> logger.error("Can not process update $it", e) }
+            processorScope.launch {
+                runCatching { consume(it) }
+                    .onFailure { e -> logger.error("Can not process update $it", e) }
+            }
         }
+    }
+
+    fun cleanup() {
+        processorScope.cancel()
     }
 
     private fun consume(update: Update) {
@@ -49,23 +67,13 @@ class Bot(
 
         val chatId = update.message.chatId
         if (chatId !in chatsAndPlaylistNames) {
-            logger.info("Got an update from unauthorized chat")
+            logger.info("Got an update from unauthorized chat $chatId")
             return
         }
 
         if (!update.message.hasEntities()) {
             logger.info("Got an update with no entities")
             return
-        }
-
-        if (!spotifyService.isReady()) {
-            logger.info("Spotify service is not ready")
-            telegramClient.execute(
-                SendMessage(
-                    chatId.toString(),
-                    "Нет авторизации в spotify, пните разраба"
-                )
-            )
         }
 
         val entities = update.message.entities
@@ -83,19 +91,14 @@ class Bot(
             return
         }
 
+        telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
         var initialMessage = update.message.text
         val links = entities
             .filter { entity -> entity.type == "url" }
             .mapNotNull(odesilService::detect)
             .mapIndexed { index, odesilEntity ->
-                initialMessage = initialMessage.replace(
-                    odesilEntity.messageEntity.text,
-                    "[${index + 1}]"
-                )
-                updatePlaylist(entities, chatId, odesilEntity.odesilResponse)
                 mapOdesilResponse(odesilEntity.odesilResponse)
             }
-
 
         if (links.isEmpty()) {
             logger.info("No links from Odesil, returning")
@@ -110,36 +113,45 @@ class Bot(
             links.mapIndexed { index, l -> "${index + 1}. $l" }.joinToString(separator = "\n\n")
         }
 
-        initialMessage = initialMessage.takeIf { it != "[1]" } ?: ""
-        val message =
-            "<b><a href=\"tg://user?id=$fromId\">@$from</a></b> написал(а): $initialMessage\n\n$linksMessage"
+        val message = "$linksMessage"
 
         logger.info("Sending message: $message")
-        telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true) })
-        logger.info("Deleting original message ${update.message.messageId}")
-        telegramClient.execute(DeleteMessage(chatId.toString(), update.message.messageId))
-    }
+        val replyToMessageId = update.message.getMessageId()
+        val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId) })
+        val tmId = textMessage.messageId
 
-    private fun updatePlaylist(entities: List<MessageEntity>, chatId: Long, odesilResponse: OdesilResponse) {
-        coroutine.launch {
-            runCatching {
-                logger.info("Updating playlist for $odesilResponse")
-                val addEntireAlbum = entities
-                    .any { it.type == "hashtag" && it.text == "#вплейлист" }
-                spotifyService.updatePlaylist(
-                    getPlaylistNamePrefix(chatId),
-                    odesilResponse,
-                    addEntireAlbum
-                )
-            }
-                .onFailure { logger.error("Failed to update playlist:", it) }
+        val yturl = extractFirstUrlByText(message, "Youtube")
+        if (yturl == null) {
+            return
         }
+        telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
+        val downloadedFile = downloadVideo(yturl, "--cookies", "/cookies.txt", "-t", "mp4", "--write-thumbnail", "--embed-thumbnail", "--convert-thumbnails", "jpg")
+        val thumbnailFile = downloadedFile.changeExtension("jpg")
+        val (videoWidth, videoHeight, videoDuration) = getVideoDimensions(downloadedFile).split(",").map { it.toDouble().toInt() }
+        val video = SendVideo
+            .builder()
+            .video(InputFile(downloadedFile))
+            .thumbnail(InputFile(thumbnailFile))
+            .cover(InputFile(thumbnailFile))
+            .width(videoWidth)
+            .height(videoHeight)
+            .duration(videoDuration)
+            .caption(message)
+            .parseMode("HTML")
+            .showCaptionAboveMedia(true)
+            .supportsStreaming(true)
+            .chatId(chatId)
+            .replyToMessageId(replyToMessageId)
+            .build()
+        telegramClient.execute(video)
+        downloadedFile.delete()
+        thumbnailFile.delete()
+        logger.info("Deleting intermediate text message $tmId")
+        telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
     }
 
     private suspend fun processCommands(update: Update, command: String) {
         when (command) {
-            "/current_playlist" -> sendCurrentPlaylist(update)
-            "/all_playlists" -> sendAllPlaylists(update)
             "/help" -> sendHelp(update)
         }
     }
@@ -149,56 +161,16 @@ class Bot(
         telegramClient.execute(SendMessage(update.message.chatId.toString(), helpMessage))
     }
 
-    private suspend fun sendCurrentPlaylist(update: Update) {
-        logger.info("sending current playlist")
-        val chatId = update.message.chatId
-        val playlist = spotifyService.getCurrentPlaylist(getPlaylistNamePrefix(chatId))
-        telegramClient.execute(
-            SendMessage(
-                chatId.toString(), "<a href=\"${playlist.url}\">${playlist.name}</a>"
-            ).apply {
-                replyToMessageId = update.message.messageId
-                enableHtml(true)
-            }
-        )
-    }
-
-    private suspend fun sendAllPlaylists(update: Update) {
-        logger.info("sending all playlists")
-        val playlistNamePrefix = getPlaylistNamePrefix(update.message.chatId)
-        val playlists = spotifyService.getAllPlaylists(playlistNamePrefix)
-        val message = playlists.mapIndexed { i, p ->
-            "${i + 1}. <a href=\"${p.url}\">${p.name}</a>"
-        }.joinToString(separator = "\n")
-        telegramClient.execute(
-            SendMessage(
-                update.message.chatId.toString(), message
-            ).apply {
-                enableHtml(true)
-                disableWebPagePreview()
-                replyToMessageId = update.message.messageId
-            }
-        )
-    }
-
     private val platformOrder = listOf(
-        "spotify" to "Spotify",
         "yandex" to "Yandex.Music",
-        "appleMusic" to "Apple Music",
-        "itunes" to "iTunes",
         "youtube" to "YouTube",
         "youtubeMusic" to "YouTube Music",
+        "appleMusic" to "Apple Music",
+        "itunes" to "iTunes",
+        "spotify" to "Spotify",
         "google" to "Google",
         "googleStore" to "Google Store",
-        "pandora" to "Pandora",
-        "deezer" to "Deezer",
-        "tidal" to "Tidal",
-        "amazonStore" to "Amazon Store",
-        "amazonMusic" to "Amazon Music",
-        "soundcloud" to "SoundCloud",
-        "napster" to "Napster",
-        "spinrilla" to "Spinrilla",
-        "audius" to "Audius"
+        "soundcloud" to "SoundCloud"
     )
 
     private fun mapOdesilResponse(odesilResponse: OdesilResponse): String {
@@ -213,11 +185,6 @@ class Bot(
         { (platformName, platformData) -> "<a href=\"${platformData.url}\">${platformName}</a>" }
     }
 
-    private fun getPlaylistNamePrefix(chatId: Long): String {
-        return chatsAndPlaylistNames[chatId]
-            ?: throw IllegalStateException("Playlist name is not found for chat $chatId")
-    }
-
     private fun getCommand(entities: List<MessageEntity>): String? {
         val entityText = entities.firstOrNull { entity -> entity.type == "bot_command" }?.text
         return if (entityText != null && (!entityText.contains("@") || entityText.contains(botName)))
@@ -230,5 +197,65 @@ class Bot(
     private fun getResource(name: String): String {
         return this::class.java.classLoader.getResource(name)?.readText()
             ?: throw IllegalStateException("Resource $name is not found")
+    }
+
+    private fun downloadVideo(url: String, vararg params: String): File {
+        return download("${UUID.randomUUID()}.%(ext)s", url, *params)
+    }
+
+    private fun downloadAudio(url: String, vararg params: String): File {
+        return download("%(title)s.%(ext)s", url, "-x", "--audio-format", "mp3", "--no-playlist", *params)
+    }
+
+    private fun download(filename: String, url: String, vararg params: String): File {
+        logger.info("Running yt-dlp for $url...")
+        val folderName = UUID.randomUUID().toString()
+        val folder = File("/tmp", folderName).apply { mkdir() }
+        val process =
+            ProcessBuilder(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename", *params).start()
+        process.inputStream.reader(Charsets.UTF_8).use { logger.info(it.readText()) }
+        process.waitFor()
+        logger.info("Finished running yt-dlp for $url")
+        var downloadedFile = folder.listFiles().first()
+        downloadedFile = downloadedFile.changeExtension("mp4")
+        downloadedFile.deleteOnExit()
+        fileDeleteScope.launch {
+            runCatching {
+                delay(5.minutes)
+                downloadedFile.delete()
+                logger.info("${downloadedFile.absolutePath} is deleted")
+            }.onFailure {
+                logger.error("Could not delete ${downloadedFile.absolutePath}")
+            }
+        }
+        return downloadedFile
+    }
+
+    private fun extractFirstUrlByText(html: String, linkText: String): String? {
+        val doc = Jsoup.parse(html)
+        val element = doc.select("a:containsOwn($linkText)").first()
+        return element?.attr("href")
+    }
+
+    private fun File.changeExtension(newExtension: String): File {
+        val newName = "${this.nameWithoutExtension}.$newExtension"
+        return this.resolveSibling(newName)
+    }
+
+    private fun getVideoDimensions(videoFile: File): String {
+        logger.info("Running ffprobe for $videoFile...")
+        val command = listOf("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "csv=p=0", videoFile.absolutePath)
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true) // Merge error stream with output
+            .start()
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val output = reader.readLine() // Read first line of output
+        logger.info("Got $output from ffprobe")
+        process.waitFor()
+        return output
+    }
+    fun cleanup() {
+        processorScope.cancel()
     }
 }

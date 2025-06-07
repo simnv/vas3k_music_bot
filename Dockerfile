@@ -11,8 +11,12 @@ COPY ./src ./src
 
 RUN mvn package -DskipTests
 
-FROM openjdk:17-jdk-slim
+FROM eclipse-temurin:22-alpine
+RUN apk update && apk add curl python3 bash ffmpeg \
+    && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
 
 COPY --from=build /app/target/vas3k_music.jar /usr/local/lib/vas3k_music.jar
+# COPY --from=jauderho/yt-dlp:latest /usr/local/bin/yt-dlp /usr/local/bin
 
 ENTRYPOINT ["java","-Xmx32m","-jar","/usr/local/lib/vas3k_music.jar"]

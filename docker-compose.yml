@@ -1,6 +1,13 @@
-version: "3.3"
-
 services:
+ tgbot-api:
+    image: aiogram/telegram-bot-api:latest
+    environment:
+      - TELEGRAM_API_ID
+      - TELEGRAM_API_HASH
+      - TELEGRAM_LOCAL
+      # - TELEGRAM_VERBOSITY
+    networks:
+      - tg
  music:
     build:
       dockerfile: ./Dockerfile
@@ -8,6 +15,7 @@ services:
     restart: always
     volumes:
       - data:/data
+      - ./cookies.txt:/cookies.txt
     environment:
       - TOKEN_STORAGE_PATH=/data
       - SPOTIFY_CLIENT_ID
@@ -15,9 +23,17 @@ services:
       - SPOTIFY_REDIRECT_URL
       - TELEGRAM_API_TOKEN
       - TELEGRAM_BOT_USERNAME
-    ports:
-      - "127.0.0.1:9999:9999"
-
+      - TELEGRAM_BASE_SCHEMA
+      - TELEGRAM_BASE_URL
+      - TELEGRAM_BASE_PORT
+      - YTDL_LOCATION
+    depends_on:
+      - tgbot-api
+    networks:
+      - tg
 
 volumes:
   data:
+
+networks:
+  tg:
