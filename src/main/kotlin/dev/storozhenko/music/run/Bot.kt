@@ -25,11 +25,13 @@ import java.util.UUID
 import org.jsoup.Jsoup
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.net.URL
 
 class Bot(
     private val botName: String,
     private val ytdlLocation: String,
-    private val telegramClient: TelegramClient
+    private val telegramClient: TelegramClient,
+    private val telegramAllowList: String
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
     private val odesilService = OdesilService()
@@ -38,9 +40,9 @@ class Bot(
     }
     private val coroutine = CoroutineScope(Dispatchers.IO + SupervisorJob() + handler)
     private val helpMessage = getResource("help_message.txt")
-    private val chatsAndPlaylistNames = getResource("allow_list.txt")
-        .split("\n")
-        .map { line -> line.split(" ") }
+    private val chatsAndPlaylistNames = telegramAllowList
+        .split(",")
+        .map { line -> line.split(":") }
         .associate { (id, prefix) -> id.toLong() to prefix }
     private val fileDeleteScope = CoroutineScope(Dispatchers.Default)
     private val processorScope = CoroutineScope(Dispatchers.Default)
@@ -53,10 +55,6 @@ class Bot(
                     .onFailure { e -> logger.error("Can not process update $it", e) }
             }
         }
-    }
-
-    fun cleanup() {
-        processorScope.cancel()
     }
 
     private fun consume(update: Update) {
@@ -99,18 +97,27 @@ class Bot(
             .mapIndexed { index, odesilEntity ->
                 mapOdesilResponse(odesilEntity.odesilResponse)
             }
+        val vkLinks = entities
+            .filter { entity -> entity.type == "url" && isVkUrl(entity.text) }
 
-        if (links.isEmpty()) {
-            logger.info("No links from Odesil, returning")
+        if (links.isEmpty() && vkLinks.isEmpty()) {
+            logger.info("No links from Odesil or vk, returning")
             return
         }
 
         val from = update.message.from.userName
         val fromId = update.message.from.id
-        val linksMessage = if (links.size == 1) {
-            links.first()
-        } else {
-            links.mapIndexed { index, l -> "${index + 1}. $l" }.joinToString(separator = "\n\n")
+        lateinit var linksMessage: String
+        if (!links.isEmpty()) {
+            linksMessage = if (links.size == 1) {
+                links.first()
+            } else {
+                links.mapIndexed { index, l -> "${index + 1}. $l" }.joinToString(separator = "\n\n")
+            }
+        } else if (!vkLinks.isEmpty()) {
+            val vkLink = vkLinks.first()
+            val videoTitle = getVideoTitle(vkLink.text)
+            linksMessage = "$videoTitle\n<a href=\"${vkLink.text}\">VK</a>"
         }
 
         val message = "$linksMessage"
@@ -121,11 +128,20 @@ class Bot(
         val tmId = textMessage.messageId
 
         val yturl = extractFirstUrlByText(message, "Youtube")
-        if (yturl == null) {
-            return
+        if (yturl != null) {
+            downloadAndSendVideo(yturl, message, replyToMessageId, chatId)
+        } else if (!vkLinks.isEmpty()) {
+            val vkurl = vkLinks.first().text
+            downloadAndSendVideo(vkurl, message, replyToMessageId, chatId)
         }
+
+        logger.info("Deleting intermediate text message $tmId")
+        telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
+    }
+
+    private fun downloadAndSendVideo(url: String, message:String, rmid: Int, chatId: Long) {
         telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
-        val downloadedFile = downloadVideo(yturl, "--cookies", "/cookies.txt", "-t", "mp4", "--write-thumbnail", "--embed-thumbnail", "--convert-thumbnails", "jpg")
+        val downloadedFile = downloadVideo(url, "--cookies", "/cookies.txt", "-t", "mp4", "--write-thumbnail", "--embed-thumbnail", "--convert-thumbnails", "jpg")
         val thumbnailFile = downloadedFile.changeExtension("jpg")
         val (videoWidth, videoHeight, videoDuration) = getVideoDimensions(downloadedFile).split(",").map { it.toDouble().toInt() }
         val video = SendVideo
@@ -141,13 +157,11 @@ class Bot(
             .showCaptionAboveMedia(true)
             .supportsStreaming(true)
             .chatId(chatId)
-            .replyToMessageId(replyToMessageId)
+            .replyToMessageId(rmid)
             .build()
         telegramClient.execute(video)
         downloadedFile.delete()
         thumbnailFile.delete()
-        logger.info("Deleting intermediate text message $tmId")
-        telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
     }
 
     private suspend fun processCommands(update: Update, command: String) {
@@ -255,7 +269,28 @@ class Bot(
         process.waitFor()
         return output
     }
-    fun cleanup() {
-        processorScope.cancel()
+
+    private fun getVideoTitle(url: String): String {
+        logger.info("Running yt-dlp to get title for $url...")
+        val command = listOf("yt-dlp", "--print", "%(title)s", url)
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true) // Merge error stream with output
+            .start()
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val output = reader.readLine() // Read first line of output
+        logger.info("Got $output from yt-dlp")
+        process.waitFor()
+        return output
+    }
+
+    fun isVkUrl(urlString: String): Boolean {
+        return try {
+            val url = URL(urlString)
+            val host = url.host
+            (host == "vk.com" || host == "vk.ru" || host.endsWith(".vk.com") || host.endsWith(".vk.ru")) && (url.path.startsWith("/video") || url.path.startsWith("/clip"))
+        } catch (e: Exception) {
+            false
+        }
     }
 }

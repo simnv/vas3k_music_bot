@@ -14,6 +14,7 @@ private val telegramBaseSchema = getEnv("TELEGRAM_BASE_SCHEMA")
 private val telegramBaseURL = getEnv("TELEGRAM_BASE_URL")
 private val telegramBasePort = getEnv("TELEGRAM_BASE_PORT").toInt()
 private val ytdlLocation = getEnv("YTDL_LOCATION")
+private val telegramAllowList = getEnv("TELEGRAM_ALLOW_LIST")
 
 fun main() {
     val telegramBotsApi = TelegramBotsLongPollingApplication()
@@ -21,7 +22,7 @@ fun main() {
     val tokenStorage = TokenStorage(tokenStoragePath)
     val telegramURL = TelegramUrl(telegramBaseSchema, telegramBaseURL, telegramBasePort, false)
     val telegramClient = OkHttpTelegramClient(botToken, telegramURL)
-    val bot = Bot(botUsername, ytdlLocation, telegramClient)
+    val bot = Bot(botUsername, ytdlLocation, telegramClient, telegramAllowList)
     try {
         telegramBotsApi.registerBot(botToken, bot)
     } catch (e: Exception) {
