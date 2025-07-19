@@ -19,7 +19,10 @@ import org.telegram.telegrambots.meta.api.objects.MessageEntity
 import org.telegram.telegrambots.meta.api.objects.Update
 import org.telegram.telegrambots.meta.generics.TelegramClient
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo
+import org.telegram.telegrambots.meta.api.methods.send.SendAudio
 import org.telegram.telegrambots.meta.api.objects.InputFile
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
 import java.util.UUID
 import org.jsoup.Jsoup
@@ -124,42 +127,87 @@ class Bot(
 
         logger.info("Sending message: $message")
         val replyToMessageId = update.message.getMessageId()
-        val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId) })
+        val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview() })
         val tmId = textMessage.messageId
 
         val yturl = extractFirstUrlByText(message, "Youtube")
         if (yturl != null) {
-            downloadAndSendVideo(yturl, message, replyToMessageId, chatId)
+            downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId)
         } else if (!vkLinks.isEmpty()) {
             val vkurl = vkLinks.first().text
-            downloadAndSendVideo(vkurl, message, replyToMessageId, chatId)
+            downloadAndSendVideo(vkurl, message, tmId, replyToMessageId, chatId)
         }
 
         logger.info("Deleting intermediate text message $tmId")
         telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
     }
 
-    private fun downloadAndSendVideo(url: String, message:String, rmid: Int, chatId: Long) {
-        telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
-        val downloadedFile = downloadVideo(url, "--cookies", "/cookies.txt", "-t", "mp4", "--write-thumbnail", "--embed-thumbnail", "--convert-thumbnails", "jpg")
+    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long) {
+        telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
+        editMessageText(chatId, intermediateMessageId, "$message\nDownloading...")
+        val downloadedFile = download(
+            "${UUID.randomUUID()}.%(ext)s",
+            url, 
+            "--cookies", "/cookies.txt",
+            "-t", "mp4",
+            "-I", "0",
+            "--playlist-items", "1",
+            "--write-thumbnail",
+            "--embed-thumbnail",
+            "--convert-thumbnails", "jpg"
+        )
         val thumbnailFile = downloadedFile.changeExtension("jpg")
+        if(thumbnailFile.exists()) {
+            delayedDelete(thumbnailFile)
+        }
+        editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
         val (videoWidth, videoHeight, videoDuration) = getVideoDimensions(downloadedFile).split(",").map { it.toDouble().toInt() }
-        val video = SendVideo
+        val (artist, title) = message.lineSequence().first().split2ByDash(true)
+        logger.info("Sending Audio...")
+        editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
+        telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
+        val audio = SendAudio
             .builder()
-            .video(InputFile(downloadedFile))
+            .audio(InputFile(downloadedFile))
             .thumbnail(InputFile(thumbnailFile))
-            .cover(InputFile(thumbnailFile))
-            .width(videoWidth)
-            .height(videoHeight)
             .duration(videoDuration)
-            .caption(message)
+            .caption(message.removeFirstLine())
             .parseMode("HTML")
-            .showCaptionAboveMedia(true)
-            .supportsStreaming(true)
+            .performer(artist)
+            .title(title)
             .chatId(chatId)
             .replyToMessageId(rmid)
             .build()
-        telegramClient.execute(video)
+        val audioMessage = telegramClient.execute(audio)
+
+
+        editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
+        val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
+        val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
+        logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
+
+        if ((totalFreezeDuration / videoCheckFreezeDuration) < 0.5) {
+            editMessageText(chatId, intermediateMessageId, "$message\nSending Video...")
+            logger.info("Sending Video...")
+            telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
+            val video = SendVideo
+                .builder()
+                .video(InputFile(downloadedFile))
+                .thumbnail(InputFile(thumbnailFile))
+                .cover(InputFile(thumbnailFile))
+                .width(videoWidth)
+                .height(videoHeight)
+                .duration(videoDuration)
+                .caption(message)
+                .parseMode("HTML")
+                .showCaptionAboveMedia(true)
+                .supportsStreaming(true)
+                .chatId(chatId)
+                .replyToMessageId(audioMessage.messageId)
+                .build()
+            telegramClient.execute(video)
+        }
+
         downloadedFile.delete()
         thumbnailFile.delete()
     }
@@ -221,6 +269,19 @@ class Bot(
         return download("%(title)s.%(ext)s", url, "-x", "--audio-format", "mp3", "--no-playlist", *params)
     }
 
+    private fun delayedDelete(fileToDelete: File) {
+        fileToDelete.deleteOnExit()
+        fileDeleteScope.launch {
+            runCatching {
+                delay(55.minutes)
+                fileToDelete.delete()
+                logger.info("${fileToDelete.absolutePath} is deleted")
+            }.onFailure {
+                logger.error("Could not delete ${fileToDelete.absolutePath}")
+            }
+        }
+    }
+
     private fun download(filename: String, url: String, vararg params: String): File {
         logger.info("Running yt-dlp for $url...")
         val folderName = UUID.randomUUID().toString()
@@ -232,16 +293,7 @@ class Bot(
         logger.info("Finished running yt-dlp for $url")
         var downloadedFile = folder.listFiles().first()
         downloadedFile = downloadedFile.changeExtension("mp4")
-        downloadedFile.deleteOnExit()
-        fileDeleteScope.launch {
-            runCatching {
-                delay(5.minutes)
-                downloadedFile.delete()
-                logger.info("${downloadedFile.absolutePath} is deleted")
-            }.onFailure {
-                logger.error("Could not delete ${downloadedFile.absolutePath}")
-            }
-        }
+        delayedDelete(downloadedFile)
         return downloadedFile
     }
 
@@ -270,6 +322,44 @@ class Bot(
         return output
     }
 
+    private fun getTotalFreezeDuration(videoFile: File, startTime: Double, duration: Double): Double {
+        logger.info("Running ffmpeg for $videoFile to find freezes...")
+        val command = listOf(
+            "ffmpeg",
+            "-v", "error",
+            "-i", videoFile.absolutePath,
+            "-ss", startTime.toInt().toString(),
+            "-t", duration.toInt().toString(),
+            "-vf", "freezedetect=n=-60dB:d=1,metadata=mode=print:file=-",
+            "-map", "0:v:0",
+            "-f", "null",
+            "-"
+        )
+        logger.info(command.joinToString(" "))
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .start()
+
+        var totalFreezeDuration = 0.0
+        val freezeDurationPattern = Regex("lavfi\\.freezedetect\\.freeze_duration=(\\d+\\.?\\d*)")
+
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                logger.info(line)
+                
+                // Check for freeze duration and add to total
+                freezeDurationPattern.find(line)?.let { match ->
+                    totalFreezeDuration += match.groupValues[1].toDouble()
+                }
+            }
+        }
+
+        process.waitFor()
+        logger.info("Total Freeze Duration: $totalFreezeDuration")
+        return totalFreezeDuration
+    }
+
     private fun getVideoTitle(url: String): String {
         logger.info("Running yt-dlp to get title for $url...")
         val command = listOf("yt-dlp", "--print", "%(title)s", url)
@@ -284,13 +374,79 @@ class Bot(
         return output
     }
 
-    fun isVkUrl(urlString: String): Boolean {
+    private fun isVkUrl(urlString: String): Boolean {
         return try {
             val url = URL(urlString)
-            val host = url.host
-            (host == "vk.com" || host == "vk.ru" || host.endsWith(".vk.com") || host.endsWith(".vk.ru")) && (url.path.startsWith("/video") || url.path.startsWith("/clip"))
+            val host = url.host.lowercase()
+            val path = url.path.lowercase()
+            
+            val isValidVkDomain = host.run {
+                this == "vk.com" || 
+                this == "vk.ru" || 
+                this == "vkvideo.ru" || 
+                endsWith(".vkvideo.ru") || 
+                endsWith(".vk.ru") || 
+                endsWith(".vk.com")
+            }
+            
+            val isVideoPath = path.run {
+                startsWith("/video") || 
+                startsWith("/clip") || 
+                startsWith("/video_ext.php") || 
+                contains("/video-") || 
+                contains("/clip-")
+            }
+            
+            isValidVkDomain && isVideoPath
         } catch (e: Exception) {
             false
         }
     }
+
+    private fun splitAudioAndVideo(videoFile: File, videoFileName: String, audioFileName: String): String {
+        logger.info("Running ffmpeg for splitting $videoFile...")
+        val command = listOf("ffmpeg", "-i", videoFile.absolutePath,
+            "-v", "error",
+            "-an", "-c:v", "copy", videoFileName,
+            "-vn", "-c:a", "copy", audioFileName)
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true) // Merge error stream with output
+            .start()
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val output = reader.readLine() // Read first line of output
+        logger.info("Got $output from ffprobe")
+        process.waitFor()
+        return output
+    }
+
+    private fun editMessageText(chatId: Long, messageId: Int, newText: String) {
+        val editMessage = EditMessageText.builder()
+            .chatId(chatId.toString())
+            .messageId(messageId)
+            .text(newText)
+            .parseMode("HTML")
+            .disableWebPagePreview(true)
+            .build()
+
+        try {
+            telegramClient.execute(editMessage)
+        } catch (e: TelegramApiException) {
+            // Handle error (message might not exist or bot doesn't have permission)
+            println("Failed to edit message: ${e.message}")
+        }
+    }
+}
+
+fun String.split2ByDash(reverseIfSingle: Boolean = false): Pair<String, String> {
+    val parts = this.split(" - ", limit = 2)
+    return when {
+        parts.size == 2 -> parts[0] to parts[1]
+        reverseIfSingle -> "" to parts[0]
+        else -> parts[0] to ""
+    }
+}
+
+fun String.removeFirstLine(): String {
+    return this.lineSequence().drop(1).joinToString("\n")
 }
