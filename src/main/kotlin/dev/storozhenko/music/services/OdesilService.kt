@@ -21,7 +21,7 @@ class OdesilService {
     }
 
     fun detect(messageEntity: MessageEntity): OdesilEntity? {
-        val encodedUrl = URLEncoder.encode(messageEntity.text, Charset.defaultCharset())
+        val encodedUrl = URLEncoder.encode(messageEntity.text.substringBefore("?list="), Charset.defaultCharset())
         val request = HttpRequest.newBuilder()
             .uri(URI.create("https://api.song.link/v1-alpha.1/links?url=$encodedUrl"))
             .build()
