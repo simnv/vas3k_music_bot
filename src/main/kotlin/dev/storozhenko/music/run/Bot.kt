@@ -100,11 +100,11 @@ class Bot(
             .mapIndexed { index, odesilEntity ->
                 mapOdesilResponse(odesilEntity.odesilResponse)
             }
-        val vkLinks = entities
-            .filter { entity -> entity.type == "url" && isVkUrl(entity.text) }
+        val validLinks = entities
+            .filter { entity -> entity.type == "url" && isValidDownloadUrl(entity.text) }
 
-        if (links.isEmpty() && vkLinks.isEmpty()) {
-            logger.info("No links from Odesil or vk, returning")
+        if (links.isEmpty() && validLinks.isEmpty()) {
+            logger.info("No links from Odesil or valid video services, returning")
             return
         }
 
@@ -117,10 +117,10 @@ class Bot(
             } else {
                 links.mapIndexed { index, l -> "${index + 1}. $l" }.joinToString(separator = "\n\n")
             }
-        } else if (!vkLinks.isEmpty()) {
-            val vkLink = vkLinks.first()
-            val videoTitle = getVideoTitle(vkLink.text)
-            linksMessage = "$videoTitle\n<a href=\"${vkLink.text}\">VK</a>"
+        } else if (!validLinks.isEmpty()) {
+            val validLink = validLinks.first()
+            val videoTitle = getVideoTitle(validLink.text)
+            linksMessage = "$videoTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
         }
 
         val message = "$linksMessage"
@@ -133,9 +133,9 @@ class Bot(
         val yturl = extractFirstUrlByText(message, "Youtube")
         if (yturl != null) {
             downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId)
-        } else if (!vkLinks.isEmpty()) {
-            val vkurl = vkLinks.first().text
-            downloadAndSendVideo(vkurl, message, tmId, replyToMessageId, chatId)
+        } else if (!validLinks.isEmpty()) {
+            val validurl = validLinks.first().text
+            downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId)
         }
 
         logger.info("Deleting intermediate text message $tmId")
@@ -163,30 +163,33 @@ class Bot(
         editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
         val (videoWidth, videoHeight, videoDuration) = getVideoDimensions(downloadedFile).split(",").map { it.toDouble().toInt() }
         val (artist, title) = message.lineSequence().first().split2ByDash(true)
-        logger.info("Sending Audio...")
-        editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
-        telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
-        val audio = SendAudio
-            .builder()
-            .audio(InputFile(downloadedFile))
-            .thumbnail(InputFile(thumbnailFile))
-            .duration(videoDuration)
-            .caption(message.removeFirstLine())
-            .parseMode("HTML")
-            .performer(artist)
-            .title(title)
-            .chatId(chatId)
-            .replyToMessageId(rmid)
-            .build()
-        val audioMessage = telegramClient.execute(audio)
+        var sendVideo = true;
+        val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true;
+        if (idHasMusic) {
+            logger.info("Sending Audio...")
+            editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
+            telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
+            val audio = SendAudio
+                .builder()
+                .audio(InputFile(downloadedFile))
+                .thumbnail(InputFile(thumbnailFile))
+                .duration(videoDuration)
+                .caption(message.removeFirstLine())
+                .parseMode("HTML")
+                .performer(artist)
+                .title(title)
+                .chatId(chatId)
+                .replyToMessageId(rmid)
+                .build()
+            val audioMessage = telegramClient.execute(audio)
+            editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
+            val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
+            val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
+            logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
+            sendVideo = (totalFreezeDuration / videoCheckFreezeDuration) < 0.5
+        }
 
-
-        editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-        val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
-        val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
-        logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
-
-        if ((totalFreezeDuration / videoCheckFreezeDuration) < 0.5) {
+        if (sendVideo) {
             editMessageText(chatId, intermediateMessageId, "$message\nSending Video...")
             logger.info("Sending Video...")
             telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
@@ -203,7 +206,7 @@ class Bot(
                 .showCaptionAboveMedia(true)
                 .supportsStreaming(true)
                 .chatId(chatId)
-                .replyToMessageId(audioMessage.messageId)
+                .replyToMessageId(rmid)
                 .build()
             telegramClient.execute(video)
         }
@@ -226,7 +229,7 @@ class Bot(
     private val platformOrder = listOf(
         "yandex" to "Yandex.Music",
         "youtube" to "YouTube",
-        "youtubeMusic" to "YouTube Music",
+        // "youtubeMusic" to "YouTube Music",
         "appleMusic" to "Apple Music",
         "itunes" to "iTunes",
         "spotify" to "Spotify",
@@ -362,7 +365,7 @@ class Bot(
 
     private fun getVideoTitle(url: String): String {
         logger.info("Running yt-dlp to get title for $url...")
-        val command = listOf("yt-dlp", "--print", "%(title)s", url)
+        val command = listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s", url)
 
         val process = ProcessBuilder(command)
             .redirectErrorStream(true) // Merge error stream with output
@@ -374,12 +377,12 @@ class Bot(
         return output
     }
 
-    private fun isVkUrl(urlString: String): Boolean {
+    private fun isValidDownloadUrl(urlString: String): Boolean {
         return try {
             val url = URL(urlString)
             val host = url.host.lowercase()
             val path = url.path.lowercase()
-            
+
             val isValidVkDomain = host.run {
                 this == "vk.com" || 
                 this == "vk.ru" || 
@@ -388,7 +391,19 @@ class Bot(
                 endsWith(".vk.ru") || 
                 endsWith(".vk.com")
             }
-            
+
+            val isValidYoutubeDomain = host.run {
+                this == "youtube.com" || 
+                this == "youtu.be" || 
+                endsWith(".youtu.be") || 
+                endsWith(".youtube.com")
+            }
+
+            val isValidTiktokDomain = host.run {
+                this == "vt.tiktok.com" || 
+                endsWith(".tiktok.com")
+            }
+
             val isVideoPath = path.run {
                 startsWith("/video") || 
                 startsWith("/clip") || 
@@ -397,7 +412,7 @@ class Bot(
                 contains("/clip-")
             }
             
-            isValidVkDomain && isVideoPath
+            isValidTiktokDomain || isValidYoutubeDomain || (isValidVkDomain && isVideoPath)
         } catch (e: Exception) {
             false
         }
