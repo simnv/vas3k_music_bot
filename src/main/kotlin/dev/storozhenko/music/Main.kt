@@ -8,11 +8,9 @@ import java.util.concurrent.TimeUnit
 import org.telegram.telegrambots.meta.TelegramUrl
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient
 import org.telegram.telegrambots.longpolling.TelegramBotsLongPollingApplication
-import com.michaelbull.retry.policy.constantDelay
-import com.michaelbull.retry.policy.limitAttempts
-import com.michaelbull.retry.retry
-import kotlin.time.Duration.Companion.seconds
-import kotlin.time.ExperimentalTime
+import java.io.IOException
+import okhttp3.Interceptor
+import okhttp3.Response
 
 private val botToken = getEnv("TELEGRAM_API_TOKEN")
 private val botUsername = getEnv("TELEGRAM_BOT_USERNAME")
@@ -63,7 +61,7 @@ class RetryInterceptor(private val maxRetries: Int) : Interceptor {
             }
         }
 
-        lastResponse?.let { 
+        lastResponse?.let {
             return it // Return the last response if we have one
         } ?: throw lastException ?: IOException("Unknown error occurred")
     }

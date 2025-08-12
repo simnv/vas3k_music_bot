@@ -127,7 +127,7 @@ class Bot(
 
         logger.info("Sending message: $message")
         val replyToMessageId = update.message.getMessageId()
-        val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview() })
+        val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview(); disableNotification() })
         val tmId = textMessage.messageId
 
         val yturl = extractFirstUrlByText(message, "Youtube")
@@ -145,9 +145,11 @@ class Bot(
     private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long) {
         telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
         editMessageText(chatId, intermediateMessageId, "$message\nDownloading...")
+        val useIPv6orIPv4 = if (url.contains("youtu")) "-6" else "-4"
         val downloadedFile = download(
             "${UUID.randomUUID()}.%(ext)s",
             url, 
+            useIPv6orIPv4,
             "--cookies", "/cookies.txt",
             "-t", "mp4",
             "-I", "0",
@@ -176,6 +178,7 @@ class Bot(
                 .duration(videoDuration)
                 .caption(message.removeFirstLine())
                 .parseMode("HTML")
+                .disableNotification(true)
                 .performer(artist)
                 .title(title)
                 .chatId(chatId)
@@ -205,6 +208,7 @@ class Bot(
                 .parseMode("HTML")
                 .showCaptionAboveMedia(true)
                 .supportsStreaming(true)
+                .disableNotification(true)
                 .chatId(chatId)
                 .replyToMessageId(rmid)
                 .build()
@@ -289,6 +293,7 @@ class Bot(
         logger.info("Running yt-dlp for $url...")
         val folderName = UUID.randomUUID().toString()
         val folder = File("/tmp", folderName).apply { mkdir() }
+        logger.info(params.joinToString(" "))
         val process =
             ProcessBuilder(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename", *params).start()
         process.inputStream.reader(Charsets.UTF_8).use { logger.info(it.readText()) }
@@ -365,7 +370,9 @@ class Bot(
 
     private fun getVideoTitle(url: String): String {
         logger.info("Running yt-dlp to get title for $url...")
-        val command = listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s", url)
+        val useIPv6orIPv4 = if (url.contains("youtu")) "-6" else "-4"
+        val command = listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s", useIPv6orIPv4, url)
+        logger.info(command.joinToString(" "))
 
         val process = ProcessBuilder(command)
             .redirectErrorStream(true) // Merge error stream with output
@@ -374,49 +381,68 @@ class Bot(
         val output = reader.readLine() // Read first line of output
         logger.info("Got $output from yt-dlp")
         process.waitFor()
+        if (output.contains(": No video formats found!")) {
+            return ""
+        }
         return output
     }
 
-    private fun isValidDownloadUrl(urlString: String): Boolean {
-        return try {
+    data class DomainConfig(
+        val hosts: Set<String>, // exact host names
+        val allowedPaths: Set<String>, // path must start with one of these
+        val blockedPathPrefixes: Set<String> = emptySet(),
+        val extraPathTokens: Set<String> = emptySet()
+    )
+
+    private val VALID_URL_CONFIG = mapOf(
+        "youtube" to DomainConfig(
+            hosts = setOf("youtube.com", "youtu.be"),
+            allowedPaths = setOf("/watch", "/shorts/", "/embed/", "/v/"),
+            blockedPathPrefixes = setOf("/post/")
+        ),
+
+        "tiktok" to DomainConfig(
+            hosts = setOf("tiktok.com", "vt.tiktok.com"),
+            allowedPaths = setOf("/"),
+            blockedPathPrefixes = emptySet()
+        ),
+
+        "vk" to DomainConfig(
+            hosts = setOf("vk.com", "vk.ru", "vkvideo.ru"),
+            allowedPaths = setOf("/video", "/clip"),
+            blockedPathPrefixes = emptySet(),
+            extraPathTokens = setOf("/video-", "/clip-")
+        ),
+
+        "rutube" to DomainConfig(
+            hosts = setOf("rutube.ru"),
+            allowedPaths = setOf("/video"),
+            blockedPathPrefixes = emptySet()
+        )
+    )
+
+    private fun isValidDownloadUrl(urlString: String): Boolean =
+        runCatching {
             val url = URL(urlString)
             val host = url.host.lowercase()
             val path = url.path.lowercase()
 
-            val isValidVkDomain = host.run {
-                this == "vk.com" || 
-                this == "vk.ru" || 
-                this == "vkvideo.ru" || 
-                endsWith(".vkvideo.ru") || 
-                endsWith(".vk.ru") || 
-                endsWith(".vk.com")
-            }
+            // Find the first config whose host matches (exact or sub-domain)
+            val cfg = VALID_URL_CONFIG.values.firstOrNull { cfg ->
+                cfg.hosts.any { exact ->
+                    host == exact || host.endsWith(".$exact")
+                }
+            } ?: return false
 
-            val isValidYoutubeDomain = host.run {
-                this == "youtube.com" || 
-                this == "youtu.be" || 
-                endsWith(".youtu.be") || 
-                endsWith(".youtube.com")
-            }
+            // 1. Reject blocked prefixes
+            if (cfg.blockedPathPrefixes.any { path.startsWith(it) }) return false
 
-            val isValidTiktokDomain = host.run {
-                this == "vt.tiktok.com" || 
-                endsWith(".tiktok.com")
-            }
+            // 2. Accept explicit allowed prefixes
+            if (cfg.allowedPaths.any { path.startsWith(it) }) return true
 
-            val isVideoPath = path.run {
-                startsWith("/video") || 
-                startsWith("/clip") || 
-                startsWith("/video_ext.php") || 
-                contains("/video-") || 
-                contains("/clip-")
-            }
-            
-            isValidTiktokDomain || isValidYoutubeDomain || (isValidVkDomain && isVideoPath)
-        } catch (e: Exception) {
-            false
-        }
-    }
+            // 3. Accept extra in-path tokens (VK-style "/video-123", etc.)
+            cfg.extraPathTokens.any { path.contains(it) }
+        }.getOrDefault(false)
 
     private fun splitAudioAndVideo(videoFile: File, videoFileName: String, audioFileName: String): String {
         logger.info("Running ffmpeg for splitting $videoFile...")
