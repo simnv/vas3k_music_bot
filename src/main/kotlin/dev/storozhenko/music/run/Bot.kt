@@ -2,6 +2,7 @@ package dev.storozhenko.music.run
 
 import dev.storozhenko.music.OdesilResponse
 import dev.storozhenko.music.getLogger
+import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.OdesilService
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -34,12 +35,15 @@ class Bot(
     private val botName: String,
     private val ytdlLocation: String,
     private val telegramClient: TelegramClient,
-    private val telegramAllowList: String
+    private val telegramAllowList: String,
+    private val errorNotificationTelegramId: String?
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
+    private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
     private val odesilService = OdesilService()
     val handler = CoroutineExceptionHandler { _, exception ->
         logger.error("Caught exception: $exception")
+        errorNotificationService?.sendErrorNotification(exception)
     }
     private val coroutine = CoroutineScope(Dispatchers.IO + SupervisorJob() + handler)
     private val helpMessage = getResource("help_message.txt")
@@ -55,7 +59,10 @@ class Bot(
         updates.forEach {
             processorScope.launch {
                 runCatching { consume(it) }
-                    .onFailure { e -> logger.error("Can not process update $it", e) }
+                    .onFailure { e ->
+                        logger.error("Can not process update $it", e)
+                        errorNotificationService?.sendUpdateProcessingErrorNotification(e)
+                    }
             }
         }
     }
@@ -87,10 +94,17 @@ class Bot(
                     processCommands(update, command)
                 }.onFailure {
                     logger.error("Can't process command for $update", it)
+                    errorNotificationService?.sendCommandErrorNotification(it, command)
                 }
             }
             return
         }
+
+        // Send message with author info to error notification service
+        val authorUsername = update.message.from?.userName
+        val authorId = update.message.from?.id
+        val messageText = update.message.text
+        errorNotificationService?.sendMessageWithAuthorInfo(messageText, authorUsername, authorId)
 
         telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
         var initialMessage = update.message.text
@@ -148,7 +162,7 @@ class Bot(
         val useIPv6orIPv4 = if (url.contains("youtu")) "-6" else "-4"
         val downloadedFile = download(
             "${UUID.randomUUID()}.%(ext)s",
-            url, 
+            url,
             useIPv6orIPv4,
             "--cookies", "/cookies.txt",
             "-t", "mp4",
@@ -157,7 +171,11 @@ class Bot(
             "--write-thumbnail",
             "--embed-thumbnail",
             "--convert-thumbnails", "jpg"
-        )
+        ) ?: run {
+            editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download file: empty result")
+            Thread.sleep(5000) // 5 second pause to let user see the error message
+            return
+        }
         val thumbnailFile = downloadedFile.changeExtension("jpg")
         if(thumbnailFile.exists()) {
             delayedDelete(thumbnailFile)
@@ -222,12 +240,25 @@ class Bot(
     private suspend fun processCommands(update: Update, command: String) {
         when (command) {
             "/help" -> sendHelp(update)
+            "/test_error" -> testErrorNotification(update)
         }
     }
 
     private fun sendHelp(update: Update) {
         logger.info("sending help")
         telegramClient.execute(SendMessage(update.message.chatId.toString(), helpMessage))
+    }
+
+    private fun testErrorNotification(update: Update) {
+        logger.info("Testing error notification")
+        try {
+            // Simulate an error to test the notification system
+            throw RuntimeException("This is a test error to verify the error notification system is working correctly")
+        } catch (e: Exception) {
+            errorNotificationService?.sendErrorNotification(e, "Test Command")
+            // Send a confirmation message to the user
+            telegramClient.execute(SendMessage(update.message.chatId.toString(), "Test error notification has been sent to the configured Telegram ID."))
+        }
     }
 
     private val platformOrder = listOf(
@@ -268,11 +299,11 @@ class Bot(
             ?: throw IllegalStateException("Resource $name is not found")
     }
 
-    private fun downloadVideo(url: String, vararg params: String): File {
+    private fun downloadVideo(url: String, vararg params: String): File? {
         return download("${UUID.randomUUID()}.%(ext)s", url, *params)
     }
 
-    private fun downloadAudio(url: String, vararg params: String): File {
+    private fun downloadAudio(url: String, vararg params: String): File? {
         return download("%(title)s.%(ext)s", url, "-x", "--audio-format", "mp3", "--no-playlist", *params)
     }
 
@@ -285,11 +316,12 @@ class Bot(
                 logger.info("${fileToDelete.absolutePath} is deleted")
             }.onFailure {
                 logger.error("Could not delete ${fileToDelete.absolutePath}")
+                errorNotificationService?.sendErrorNotification(it, "File Deletion: ${fileToDelete.absolutePath}")
             }
         }
     }
 
-    private fun download(filename: String, url: String, vararg params: String): File {
+    private fun download(filename: String, url: String, vararg params: String): File? {
         logger.info("Running yt-dlp for $url...")
         val folderName = UUID.randomUUID().toString()
         val folder = File("/tmp", folderName).apply { mkdir() }
@@ -299,7 +331,12 @@ class Bot(
         process.inputStream.reader(Charsets.UTF_8).use { logger.info(it.readText()) }
         process.waitFor()
         logger.info("Finished running yt-dlp for $url")
-        var downloadedFile = folder.listFiles().first()
+        val files = folder.listFiles()
+        if (files == null || files.isEmpty()) {
+            logger.error("Can't download file for url $url")
+            return null
+        }
+        var downloadedFile = files.first()
         downloadedFile = downloadedFile.changeExtension("mp4")
         delayedDelete(downloadedFile)
         return downloadedFile
