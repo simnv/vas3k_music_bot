@@ -36,7 +36,8 @@ class Bot(
     private val ytdlLocation: String,
     private val telegramClient: TelegramClient,
     private val telegramAllowList: String,
-    private val errorNotificationTelegramId: String?
+    private val errorNotificationTelegramId: String?,
+    private val ipv6UrlContains: String?
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
     private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
@@ -53,6 +54,19 @@ class Bot(
         .associate { (id, prefix) -> id.toLong() to prefix }
     private val fileDeleteScope = CoroutineScope(Dispatchers.Default)
     private val processorScope = CoroutineScope(Dispatchers.Default)
+    
+    private fun getIpVersionParam(url: String): String? {
+        if (ipv6UrlContains.isNullOrEmpty()) {
+            return null
+        }
+        
+        val urlContainsList = ipv6UrlContains.split(",").map { it.trim() }
+        return if (urlContainsList.any { url.contains(it, ignoreCase = true) }) {
+            "-6"
+        } else {
+            "-4"
+        }
+    }
 
     override fun consume(updates: MutableList<Update>) {
         logger.info("Got ${updates.size} updates")
@@ -100,12 +114,6 @@ class Bot(
             return
         }
 
-        // Send message with author info to error notification service
-        val authorUsername = update.message.from?.userName
-        val authorId = update.message.from?.id
-        val messageText = update.message.text
-        errorNotificationService?.sendMessageWithAuthorInfo(messageText, authorUsername, authorId)
-
         telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
         var initialMessage = update.message.text
         val links = entities
@@ -140,101 +148,126 @@ class Bot(
         val message = "$linksMessage"
 
         logger.info("Sending message: $message")
+        // Send message with source info to error notification service
+        val authorUsername = update.message.from?.userName
+        val authorName = update.message.from?.firstName + (update.message.from?.lastName?.let { " $it" } ?: "")
+        val chatTitle = update.message.chat.title ?: "Private Chat"
+        errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle)
+
         val replyToMessageId = update.message.getMessageId()
         val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview(); disableNotification() })
         val tmId = textMessage.messageId
 
         val yturl = extractFirstUrlByText(message, "Youtube")
-        if (yturl != null) {
+        val success = if (yturl != null) {
             downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId)
         } else if (!validLinks.isEmpty()) {
             val validurl = validLinks.first().text
             downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId)
+        } else {
+            true // No video to download, consider it a success
         }
 
-        logger.info("Deleting intermediate text message $tmId")
-        telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
+        if (success) {
+            logger.info("Deleting intermediate text message $tmId")
+            telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
+        } else {
+            logger.info("Not deleting intermediate text message $tmId due to processing failure")
+        }
     }
 
-    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long) {
-        telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
-        editMessageText(chatId, intermediateMessageId, "$message\nDownloading...")
-        val useIPv6orIPv4 = if (url.contains("youtu")) "-6" else "-4"
-        val downloadedFile = download(
-            "${UUID.randomUUID()}.%(ext)s",
-            url,
-            useIPv6orIPv4,
-            "--cookies", "/cookies.txt",
-            "-t", "mp4",
-            "-I", "0",
-            "--playlist-items", "1",
-            "--write-thumbnail",
-            "--embed-thumbnail",
-            "--convert-thumbnails", "jpg"
-        ) ?: run {
-            editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download file: empty result")
+    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long): Boolean {
+        try {
+            telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
+            editMessageText(chatId, intermediateMessageId, "$message\nDownloading...")
+            val ipVersionParam = getIpVersionParam(url)
+            val downloadParams = mutableListOf<String>().apply {
+                ipVersionParam?.let { add(it) }
+                addAll(listOf(
+                    "--cookies", "/cookies.txt",
+                    "-t", "mp4",
+                    "-I", "0",
+                    "--playlist-items", "1",
+                    "--write-thumbnail",
+                    "--embed-thumbnail",
+                    "--convert-thumbnails", "jpg"
+                ))
+            }
+            val downloadedFile = download(
+                "${UUID.randomUUID()}.%(ext)s",
+                url,
+                *downloadParams.toTypedArray()
+            ) ?: run {
+                editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download file: empty result")
+                Thread.sleep(5000) // 5 second pause to let user see the error message
+                return false
+            }
+            val thumbnailFile = downloadedFile.changeExtension("jpg")
+            if(thumbnailFile.exists()) {
+                delayedDelete(thumbnailFile)
+            }
+            editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
+            val (videoWidth, videoHeight, videoDuration) = getVideoDimensions(downloadedFile).split(",").map { it.toDouble().toInt() }
+            val (artist, title) = message.lineSequence().first().split2ByDash(true)
+            var sendVideo = true;
+            val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true;
+            if (idHasMusic) {
+                logger.info("Sending Audio...")
+                editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
+                telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
+                val audio = SendAudio
+                    .builder()
+                    .audio(InputFile(downloadedFile))
+                    .thumbnail(InputFile(thumbnailFile))
+                    .duration(videoDuration)
+                    .caption(message.removeFirstLine())
+                    .parseMode("HTML")
+                    .disableNotification(true)
+                    .performer(artist)
+                    .title(title)
+                    .chatId(chatId)
+                    .replyToMessageId(rmid)
+                    .build()
+                val audioMessage = telegramClient.execute(audio)
+                editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
+                val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
+                val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
+                logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
+                sendVideo = (totalFreezeDuration / videoCheckFreezeDuration) < 0.5
+            }
+
+            if (sendVideo) {
+                editMessageText(chatId, intermediateMessageId, "$message\nSending Video...")
+                logger.info("Sending Video...")
+                telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
+                val video = SendVideo
+                    .builder()
+                    .video(InputFile(downloadedFile))
+                    .thumbnail(InputFile(thumbnailFile))
+                    .cover(InputFile(thumbnailFile))
+                    .width(videoWidth)
+                    .height(videoHeight)
+                    .duration(videoDuration)
+                    .caption(message)
+                    .parseMode("HTML")
+                    .showCaptionAboveMedia(true)
+                    .supportsStreaming(true)
+                    .disableNotification(true)
+                    .chatId(chatId)
+                    .replyToMessageId(rmid)
+                    .build()
+                telegramClient.execute(video)
+            }
+
+            downloadedFile.delete()
+            thumbnailFile.delete()
+            return true
+        } catch (e: Exception) {
+            logger.error("Error in downloadAndSendVideo: ${e.message}", e)
+            editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to process video: ${e.message}")
             Thread.sleep(5000) // 5 second pause to let user see the error message
-            return
+            return false
         }
-        val thumbnailFile = downloadedFile.changeExtension("jpg")
-        if(thumbnailFile.exists()) {
-            delayedDelete(thumbnailFile)
-        }
-        editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
-        val (videoWidth, videoHeight, videoDuration) = getVideoDimensions(downloadedFile).split(",").map { it.toDouble().toInt() }
-        val (artist, title) = message.lineSequence().first().split2ByDash(true)
-        var sendVideo = true;
-        val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true;
-        if (idHasMusic) {
-            logger.info("Sending Audio...")
-            editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
-            telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
-            val audio = SendAudio
-                .builder()
-                .audio(InputFile(downloadedFile))
-                .thumbnail(InputFile(thumbnailFile))
-                .duration(videoDuration)
-                .caption(message.removeFirstLine())
-                .parseMode("HTML")
-                .disableNotification(true)
-                .performer(artist)
-                .title(title)
-                .chatId(chatId)
-                .replyToMessageId(rmid)
-                .build()
-            val audioMessage = telegramClient.execute(audio)
-            editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-            val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
-            val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
-            logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
-            sendVideo = (totalFreezeDuration / videoCheckFreezeDuration) < 0.5
-        }
-
-        if (sendVideo) {
-            editMessageText(chatId, intermediateMessageId, "$message\nSending Video...")
-            logger.info("Sending Video...")
-            telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
-            val video = SendVideo
-                .builder()
-                .video(InputFile(downloadedFile))
-                .thumbnail(InputFile(thumbnailFile))
-                .cover(InputFile(thumbnailFile))
-                .width(videoWidth)
-                .height(videoHeight)
-                .duration(videoDuration)
-                .caption(message)
-                .parseMode("HTML")
-                .showCaptionAboveMedia(true)
-                .supportsStreaming(true)
-                .disableNotification(true)
-                .chatId(chatId)
-                .replyToMessageId(rmid)
-                .build()
-            telegramClient.execute(video)
-        }
-
-        downloadedFile.delete()
-        thumbnailFile.delete()
     }
 
     private suspend fun processCommands(update: Update, command: String) {
@@ -407,8 +440,12 @@ class Bot(
 
     private fun getVideoTitle(url: String): String {
         logger.info("Running yt-dlp to get title for $url...")
-        val useIPv6orIPv4 = if (url.contains("youtu")) "-6" else "-4"
-        val command = listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s", useIPv6orIPv4, url)
+        val ipVersionParam = getIpVersionParam(url)
+        val command = mutableListOf<String>().apply {
+            addAll(listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s"))
+            ipVersionParam?.let { add(it) }
+            add(url)
+        }
         logger.info(command.joinToString(" "))
 
         val process = ProcessBuilder(command)
@@ -434,7 +471,7 @@ class Bot(
     private val VALID_URL_CONFIG = mapOf(
         "youtube" to DomainConfig(
             hosts = setOf("youtube.com", "youtu.be"),
-            allowedPaths = setOf("/watch", "/shorts/", "/embed/", "/v/"),
+            allowedPaths = setOf("/watch", "/shorts/", "/embed/", "/v/", "/"),
             blockedPathPrefixes = setOf("/post/")
         ),
 
@@ -460,26 +497,56 @@ class Bot(
 
     private fun isValidDownloadUrl(urlString: String): Boolean =
         runCatching {
+            logger.info("Validating URL: $urlString")
             val url = URL(urlString)
             val host = url.host.lowercase()
             val path = url.path.lowercase()
+            logger.info("Parsed URL - host: $host, path: $path")
 
             // Find the first config whose host matches (exact or sub-domain)
             val cfg = VALID_URL_CONFIG.values.firstOrNull { cfg ->
-                cfg.hosts.any { exact ->
-                    host == exact || host.endsWith(".$exact")
+                val hostMatches = cfg.hosts.any { exact ->
+                    val matches = host == exact || host.endsWith(".$exact")
+                    if (matches) {
+                        logger.info("Host '$host' matches config for '$exact'")
+                    }
+                    matches
                 }
-            } ?: return false
+                hostMatches
+            } ?: run {
+                logger.info("No config found for host: $host")
+                return false
+            }
+
+            logger.info("Using config with hosts: ${cfg.hosts}, allowedPaths: ${cfg.allowedPaths}, blockedPathPrefixes: ${cfg.blockedPathPrefixes}, extraPathTokens: ${cfg.extraPathTokens}")
 
             // 1. Reject blocked prefixes
-            if (cfg.blockedPathPrefixes.any { path.startsWith(it) }) return false
+            val blockedPrefix = cfg.blockedPathPrefixes.find { path.startsWith(it) }
+            if (blockedPrefix != null) {
+                logger.info("URL rejected: path '$path' starts with blocked prefix '$blockedPrefix'")
+                return false
+            }
 
             // 2. Accept explicit allowed prefixes
-            if (cfg.allowedPaths.any { path.startsWith(it) }) return true
+            val allowedPrefix = cfg.allowedPaths.find { path.startsWith(it) }
+            if (allowedPrefix != null) {
+                logger.info("URL accepted: path '$path' starts with allowed prefix '$allowedPrefix'")
+                return true
+            }
 
             // 3. Accept extra in-path tokens (VK-style "/video-123", etc.)
-            cfg.extraPathTokens.any { path.contains(it) }
-        }.getOrDefault(false)
+            val extraToken = cfg.extraPathTokens.find { path.contains(it) }
+            if (extraToken != null) {
+                logger.info("URL accepted: path '$path' contains extra token '$extraToken'")
+                return true
+            }
+
+            logger.info("URL rejected: path '$path' doesn't match any allowed patterns")
+            false
+        }.getOrElse { exception ->
+            logger.error("Error validating URL '$urlString': ${exception.message}", exception)
+            false
+        }
 
     private fun splitAudioAndVideo(videoFile: File, videoFileName: String, audioFileName: String): String {
         logger.info("Running ffmpeg for splitting $videoFile...")

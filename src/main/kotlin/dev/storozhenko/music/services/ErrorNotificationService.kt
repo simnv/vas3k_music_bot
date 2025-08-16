@@ -81,33 +81,30 @@ class ErrorNotificationService(
     fun sendServiceErrorNotification(throwable: Throwable, serviceName: String) {
         sendErrorNotification(throwable, "Service Error: $serviceName")
     }
-    public fun sendMessageWithAuthorInfo(message: String, authorUsername: String?, authorId: Long?) {
+    public fun sendMessageWithSourceInfo(message: String, authorUsername: String?, chatId: Long, messageId: Int, chatTitle: String) {
         try {
             val timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now())
             val notificationMessage = buildString {
-                append("ℹ️ <b>Message Notification</b>\n\n")
-                append("<b>Time:</b> <code>$timestamp</code>\n")
-                append("<b>Message:</b> <code>${message.take(200)}</code>\n")
+                append("ℹ️ <b>Request from</b> ")
                 
                 authorUsername?.let { username ->
-                    append("<b>Author Username:</b> <code>@$username</code>\n")
+                    append("@$username")
                 }
-                
-                authorId?.let { id ->
-                    append("<b>Author ID:</b> <code>$id</code>\n")
-                }
+                append(" in <a href=\"https://t.me/c/${chatId.toString().replace("-", "")}/${messageId}\">$chatTitle</a>")
+                append("\n\n$message")
             }
             
             val sendMessage = SendMessage.builder()
                 .chatId(errorNotificationTelegramId)
                 .text(notificationMessage)
                 .parseMode("HTML")
+                .disableWebPagePreview(true)
                 .build()
             
             telegramClient.execute(sendMessage)
-            logger.info("Message with author info sent successfully")
+            logger.info("Message with source info sent successfully")
         } catch (e: Exception) {
-            logger.error("Failed to send message with author info: ${e.message}", e)
+            logger.error("Failed to send message with source info: ${e.message}", e)
         }
     }
 }

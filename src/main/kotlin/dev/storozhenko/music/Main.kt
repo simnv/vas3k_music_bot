@@ -21,6 +21,7 @@ private val telegramBasePort = getEnv("TELEGRAM_BASE_PORT").toInt()
 private val ytdlLocation = getEnv("YTDL_LOCATION")
 private val telegramAllowList = getEnv("TELEGRAM_ALLOW_LIST")
 private val errorNotificationTelegramId = System.getenv()["ERROR_NOTIFICATION_TELEGRAM_ID"]?.takeIf(String::isNotBlank)
+private val ipv6UrlContains = System.getenv()["IPV6_URL_CONTAINS"]?.takeIf(String::isNotBlank)
 
 class RetryInterceptor(private val maxRetries: Int) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -81,7 +82,7 @@ fun main() {
         .addInterceptor(RetryInterceptor(maxRetries = 5))
         .build()
     val telegramClient = OkHttpTelegramClient(httpClient, botToken, telegramURL)
-    val bot = Bot(botUsername, ytdlLocation, telegramClient, telegramAllowList, errorNotificationTelegramId)
+    val bot = Bot(botUsername, ytdlLocation, telegramClient, telegramAllowList, errorNotificationTelegramId, ipv6UrlContains)
     try {
         telegramBotsApi.registerBot(botToken, bot)
     } catch (e: Exception) {
