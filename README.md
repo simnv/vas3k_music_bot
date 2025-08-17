@@ -52,9 +52,135 @@ ERROR_NOTIFICATION_TELEGRAM_ID=your_telegram_user_id
 IPV6_URL_CONTAINS=youtube.com,youtu.be
 ```
 
-### 4. Add Cookies (Optional)
+### 4. Telegram Bot Creation Steps
+
+To create a Telegram bot, follow these steps:
+
+1. **Create a new bot via BotFather**:
+   - Open Telegram and search for `@BotFather`
+   - Send the command `/newbot`
+   - Follow the prompts to set a name and username for your bot
+   - Save the API token provided by BotFather
+
+2. **Disable Group Privacy** (important for the bot to work in groups):
+   - In the chat with `@BotFather`, send the command `/mybots`
+   - Select your bot from the list
+   - Choose "Bot Settings" → "Group Privacy"
+   - Select "Turn off" to disable group privacy mode
+   - This allows the bot to receive all messages in groups where it's a member
+
+3. **Get your Telegram User ID** (for error notifications):
+   - Search for `@userinfobot` in Telegram
+   - Send it any message to get your user ID
+
+4. **Get Chat IDs** (for allow list):
+   - Add your bot to the desired group/channel
+   - Send a message to the bot in that chat
+   - Check the bot logs or use a service like `@JsonDumpBot` to get the chat ID
+
+### 5. Telegram Bot API Configuration
+
+This project uses a local Telegram Bot API server (aiogram/telegram-bot-api) for better performance and control. To configure it:
+
+1. **Get Telegram API credentials**:
+   - Go to [my.telegram.org](https://my.telegram.org/)
+   - Sign in with your phone number
+   - Go to "API development tools"
+   - Create a new application to get your `API_ID` and `API_HASH`
+
+2. **Configure environment variables**:
+   Add these to your `.env` file:
+
+   ```env
+   # Telegram API credentials (from my.telegram.org)
+   TELEGRAM_API_ID=your_api_id
+   TELEGRAM_API_HASH=your_api_hash
+   
+   # Local Telegram Bot API settings
+   TELEGRAM_LOCAL=1
+   TELEGRAM_BASE_SCHEMA=http
+   TELEGRAM_BASE_URL=tgbot-api
+   TELEGRAM_BASE_PORT=8081
+   ```
+
+3. **Understanding the Telegram Bot API configuration**:
+   - `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`: Required for the local Bot API server to connect to Telegram's servers
+   - `TELEGRAM_LOCAL`: Set to `1` to use the local Bot API server instead of Telegram's servers
+   - `TELEGRAM_BASE_SCHEMA`: Protocol for connecting to the local Bot API server (http/https)
+   - `TELEGRAM_BASE_URL`: Hostname of the local Bot API server (matches the service name in docker-compose.yml)
+   - `TELEGRAM_BASE_PORT`: Port for connecting to the local Bot API server
+
+### 6. Add Cookies (Optional)
 
 For better download success rates, add a `cookies.txt` file in the project root with your browser cookies for video platforms.
+
+#### Getting Cookies from Firefox
+
+You can extract cookies from Firefox using the `cookies-from-browser` feature of yt-dlp:
+
+1. **Install required dependencies**:
+   ```bash
+   # On macOS with Homebrew
+   brew install yt-dlp
+   ```
+
+2. **Extract cookies from Firefox**:
+   ```bash
+   yt-dlp --cookies-from-browser firefox --cookies cookies.txt --print-traffic https://www.youtube.com
+   ```
+   
+   This will create a `cookies.txt` file in your current directory with cookies from Firefox.
+
+3. **Alternative method using a script**:
+   If the above method doesn't work, you can use this Python script with uvx:
+   
+   ```python
+   # /// script
+   # dependencies = ["browser-cookie3"]
+   # ///
+   
+   import browser_cookie3
+   import json
+   
+   # Get cookies from Firefox
+   cj = browser_cookie3.firefox()
+   
+   # Filter for relevant domains (YouTube, TikTok, etc.)
+   domains = ['youtube.com', 'tiktok.com', 'vk.com', 'rutube.ru']
+   filtered_cookies = [cookie for cookie in cj if any(domain in cookie.domain for domain in domains)]
+   
+   # Convert to Netscape format
+   with open('cookies.txt', 'w') as f:
+       f.write("# Netscape HTTP Cookie File\n")
+       f.write("# This is a generated file! Do not edit.\n\n")
+       for cookie in filtered_cookies:
+           if cookie.value and cookie.name:
+               flag = "TRUE" if cookie.domain.startswith('.') else "FALSE"
+               path = cookie.path if cookie.path else "/"
+               secure = "TRUE" if cookie.secure else "FALSE"
+               expiry = str(cookie.expires) if cookie.expires else "0"
+               f.write(f"{cookie.domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{cookie.name}\t{cookie.value}\n")
+   
+   print("Cookies saved to cookies.txt")
+   ```
+   
+   Save this script as `extract_cookies.py` and run it with uvx:
+   ```bash
+   # Install uvx if you don't have it
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   
+   # Run the script with uvx (automatically installs dependencies)
+   uvx run extract_cookies.py
+   ```
+
+4. **Place the cookies file**:
+   Move the generated `cookies.txt` file to the project root directory.
+
+5. **Verify cookies are working**:
+   ```bash
+   docker-compose logs -f music
+   ```
+   Check the logs for successful download messages without authentication errors.
 
 ## Deployment
 
@@ -95,13 +221,34 @@ make redeploy-prod
 | `ERROR_NOTIFICATION_TELEGRAM_ID` | No | User ID for error notifications |
 | `IPV6_URL_CONTAINS` | No | Comma-separated domains for IPv6 |
 | `YTDL_LOCATION` | Auto | yt-dlp binary location (set by Docker) |
+| `TELEGRAM_API_ID` | Yes | API ID from my.telegram.org |
+| `TELEGRAM_API_HASH` | Yes | API hash from my.telegram.org |
+| `TELEGRAM_LOCAL` | Yes | Set to 1 to use local Bot API server |
+| `TELEGRAM_BASE_SCHEMA` | Yes | Protocol for local Bot API (http/https) |
+| `TELEGRAM_BASE_URL` | Yes | Hostname of local Bot API server |
+| `TELEGRAM_BASE_PORT` | Yes | Port for local Bot API server |
 
 ## Docker Configuration
 
 The bot runs in a multi-container setup:
 
 - **music**: Main bot application
-- **tgbot-api**: Local Telegram Bot API server
+- **tgbot-api**: Local Telegram Bot API server (aiogram/telegram-bot-api)
+
+### aiogram/telegram-bot-api Service
+
+The `tgbot-api` service uses the official [aiogram/telegram-bot-api](https://hub.docker.com/r/aiogram/telegram-bot-api) Docker image, which provides a local Telegram Bot API server. This offers several advantages:
+
+- **Reduced latency**: Direct connection to Telegram servers
+- **Better reliability**: No dependency on Telegram's public API servers
+- **Increased rate limits**: Higher request limits compared to the public API
+- **Custom configuration**: Ability to fine-tune API settings
+
+The service is configured with the following environment variables:
+- `TELEGRAM_API_ID`: Your Telegram API ID from my.telegram.org
+- `TELEGRAM_API_HASH`: Your Telegram API hash from my.telegram.org
+- `TELEGRAM_LOCAL`: Set to true for local API mode
+- `TELEGRAM_VERBOSITY`: (Optional) Logging verbosity level (0-5)
 
 ### Volumes
 

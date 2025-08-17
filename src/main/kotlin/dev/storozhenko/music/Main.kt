@@ -13,10 +13,10 @@ import okhttp3.Response
 
 private val botToken = getEnv("TELEGRAM_API_TOKEN")
 private val botUsername = getEnv("TELEGRAM_BOT_USERNAME")
-private val telegramBaseSchema = getEnv("TELEGRAM_BASE_SCHEMA")
-private val telegramBaseURL = getEnv("TELEGRAM_BASE_URL")
-private val telegramBasePort = getEnv("TELEGRAM_BASE_PORT").toInt()
-private val ytdlLocation = getEnv("YTDL_LOCATION")
+private val telegramBaseSchema = System.getenv()["TELEGRAM_BASE_SCHEMA"]?.takeIf(String::isNotBlank) ?: "https"
+private val telegramBaseURL = System.getenv()["TELEGRAM_BASE_URL"]?.takeIf(String::isNotBlank) ?: "api.telegram.org"
+private val telegramBasePort = System.getenv()["TELEGRAM_BASE_PORT"]?.takeIf(String::isNotBlank)?.toInt() ?: 443
+private val ytdlLocation = System.getenv()["YTDL_LOCATION"]?.takeIf(String::isNotBlank) ?: "/usr/local/bin/yt-dlp"
 private val telegramAllowList = getEnv("TELEGRAM_ALLOW_LIST")
 private val errorNotificationTelegramId = System.getenv()["ERROR_NOTIFICATION_TELEGRAM_ID"]?.takeIf(String::isNotBlank)
 private val ipv6UrlContains = System.getenv()["IPV6_URL_CONTAINS"]?.takeIf(String::isNotBlank)
