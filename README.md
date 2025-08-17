@@ -141,7 +141,7 @@ You can extract cookies from Firefox using the `cookies-from-browser` feature of
    This will create a `cookies.txt` file in your current directory with cookies from Firefox.
 
 3. **Alternative method using a script**:
-   If the above method doesn't work, you can use this Python script with uvx:
+   If the above method doesn't work, you can use this Python script with uv:
    
    ```python
    # /// script
@@ -179,7 +179,7 @@ You can extract cookies from Firefox using the `cookies-from-browser` feature of
    curl -LsSf https://astral.sh/uv/install.sh | sh
    
    # Run the script with uvx (automatically installs dependencies)
-   uvx run extract_cookies.py
+   uv run extract_cookies.py
    ```
 
 4. **Place the cookies file**:
