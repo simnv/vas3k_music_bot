@@ -177,6 +177,9 @@ class Bot(
     }
 
     private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long): Boolean {
+        var downloadedFile: File? = null
+        var thumbnailFile: File? = null
+        
         try {
             telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
             editMessageText(chatId, intermediateMessageId, "$message\nDownloading...")
@@ -193,7 +196,7 @@ class Bot(
                     "--convert-thumbnails", "jpg"
                 ))
             }
-            val downloadedFile = download(
+            downloadedFile = download(
                 "${UUID.randomUUID()}.%(ext)s",
                 url,
                 *downloadParams.toTypedArray()
@@ -202,33 +205,86 @@ class Bot(
                 Thread.sleep(5000) // 5 second pause to let user see the error message
                 return false
             }
-            val thumbnailFile = downloadedFile.changeExtension("jpg")
-            if(thumbnailFile.exists()) {
-                delayedDelete(thumbnailFile)
+            
+            // Validate downloaded file
+            val (isVideoValid, videoValidationMessage) = validateVideoFile(downloadedFile)
+            if (!isVideoValid) {
+                logger.error("Video validation failed: $videoValidationMessage")
+                editMessageText(chatId, intermediateMessageId, "$message\n❌ Video validation failed: $videoValidationMessage")
+                Thread.sleep(5000)
+                return false
             }
+            
+            // Log file size
+            val fileSizeInBytes = downloadedFile.length()
+            val fileSizeInMB = fileSizeInBytes / (1024.0 * 1024.0)
+            logger.info("Downloaded file size: ${String.format("%.2f", fileSizeInMB)} MB (${fileSizeInBytes} bytes)")
+            
+            thumbnailFile = downloadedFile.changeExtension("jpg")
+            if (!thumbnailFile.exists()) {
+                logger.warn("Thumbnail file does not exist: ${thumbnailFile.absolutePath}")
+                // Create a placeholder thumbnail or continue without it
+                thumbnailFile = null
+            } else {
+                // Validate thumbnail file
+                val (isThumbnailValid, thumbnailValidationMessage) = validateThumbnailFile(thumbnailFile)
+                if (!isThumbnailValid) {
+                    logger.warn("Thumbnail validation failed: $thumbnailValidationMessage. Continuing without thumbnail.")
+                    thumbnailFile = null
+                } else {
+                    delayedDelete(thumbnailFile)
+                }
+            }
+            
             editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
-            val (videoWidth, videoHeight, videoDuration) = getVideoDimensions(downloadedFile).split(",").map { it.toDouble().toInt() }
+            val dimensions = getVideoDimensions(downloadedFile)
+            logger.info("Video dimensions: $dimensions")
+            
+            val (videoWidth, videoHeight, videoDuration) = try {
+                dimensions.split(",").map { it.toDouble().toInt() }
+            } catch (e: Exception) {
+                logger.error("Failed to parse video dimensions: $dimensions", e)
+                editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions")
+                Thread.sleep(5000)
+                return false
+            }
+            
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
-            var sendVideo = true;
-            val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true;
+            var sendVideo = true
+            val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
+            
             if (idHasMusic) {
                 logger.info("Sending Audio...")
                 editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
                 telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
-                val audio = SendAudio
-                    .builder()
-                    .audio(InputFile(downloadedFile))
-                    .thumbnail(InputFile(thumbnailFile))
-                    .duration(videoDuration)
-                    .caption(message.removeFirstLine())
-                    .parseMode("HTML")
-                    .disableNotification(true)
-                    .performer(artist)
-                    .title(title)
-                    .chatId(chatId)
-                    .replyToMessageId(rmid)
-                    .build()
-                val audioMessage = telegramClient.execute(audio)
+                
+                try {
+                    val audioBuilder = SendAudio.builder()
+                        .audio(InputFile(downloadedFile))
+                        .duration(videoDuration)
+                        .caption(message.removeFirstLine())
+                        .parseMode("HTML")
+                        .disableNotification(true)
+                        .performer(artist)
+                        .title(title)
+                        .chatId(chatId)
+                        .replyToMessageId(rmid)
+                    
+                    // Only add thumbnail if it exists
+                    thumbnailFile?.let {
+                        audioBuilder.thumbnail(InputFile(it))
+                    }
+                    
+                    val audio = audioBuilder.build()
+                    val audioMessage = telegramClient.execute(audio)
+                    logger.info("Audio sent successfully")
+                } catch (e: TelegramApiException) {
+                    logger.error("Failed to send audio: ${e.message}", e)
+                    editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send audio: ${e.message}")
+                    Thread.sleep(5000)
+                    return false
+                }
+                
                 editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
                 val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
                 val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
@@ -240,33 +296,62 @@ class Bot(
                 editMessageText(chatId, intermediateMessageId, "$message\nSending Video...")
                 logger.info("Sending Video...")
                 telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
-                val video = SendVideo
-                    .builder()
-                    .video(InputFile(downloadedFile))
-                    .thumbnail(InputFile(thumbnailFile))
-                    .cover(InputFile(thumbnailFile))
-                    .width(videoWidth)
-                    .height(videoHeight)
-                    .duration(videoDuration)
-                    .caption(message)
-                    .parseMode("HTML")
-                    .showCaptionAboveMedia(true)
-                    .supportsStreaming(true)
-                    .disableNotification(true)
-                    .chatId(chatId)
-                    .replyToMessageId(rmid)
-                    .build()
-                telegramClient.execute(video)
+                
+                try {
+                    val videoBuilder = SendVideo.builder()
+                        .video(InputFile(downloadedFile))
+                        .width(videoWidth)
+                        .height(videoHeight)
+                        .duration(videoDuration)
+                        .caption(message)
+                        .parseMode("HTML")
+                        .showCaptionAboveMedia(true)
+                        .supportsStreaming(true)
+                        .disableNotification(true)
+                        .chatId(chatId)
+                        .replyToMessageId(rmid)
+                    
+                    // Only add thumbnail and cover if they exist
+                    thumbnailFile?.let {
+                        videoBuilder.thumbnail(InputFile(it))
+                        videoBuilder.cover(InputFile(it))
+                    }
+                    
+                    val video = videoBuilder.build()
+                    telegramClient.execute(video)
+                    logger.info("Video sent successfully")
+                } catch (e: TelegramApiException) {
+                    logger.error("Failed to send video: ${e.message}", e)
+                    editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send video: ${e.message}")
+                    Thread.sleep(5000)
+                    return false
+                }
             }
 
-            downloadedFile.delete()
-            thumbnailFile.delete()
             return true
         } catch (e: Exception) {
             logger.error("Error in downloadAndSendVideo: ${e.message}", e)
             editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to process video: ${e.message}")
             Thread.sleep(5000) // 5 second pause to let user see the error message
             return false
+        } finally {
+            // Clean up files in finally block to ensure they're always deleted
+            try {
+                downloadedFile?.let { file ->
+                    if (file.exists()) {
+                        file.delete()
+                        logger.info("Deleted downloaded file: ${file.absolutePath}")
+                    }
+                }
+                thumbnailFile?.let { file ->
+                    if (file.exists()) {
+                        file.delete()
+                        logger.info("Deleted thumbnail file: ${file.absolutePath}")
+                    }
+                }
+            } catch (e: Exception) {
+                logger.error("Error cleaning up files: ${e.message}", e)
+            }
         }
     }
 
@@ -439,10 +524,10 @@ class Bot(
     }
 
     private fun getVideoTitle(url: String): String {
-        logger.info("Running yt-dlp to get title for $url...")
+        logger.info("Running yt-dlp to get title and duration for $url...")
         val ipVersionParam = getIpVersionParam(url)
         val command = mutableListOf<String>().apply {
-            addAll(listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s"))
+            addAll(listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s [%(duration)s]"))
             ipVersionParam?.let { add(it) }
             add(url)
         }
@@ -458,7 +543,16 @@ class Bot(
         if (output.contains(": No video formats found!")) {
             return ""
         }
-        return output
+        
+        // Format the duration from seconds to MM:SS
+        val formattedOutput = output.replace(Regex("\\[(\\d+)\\]")) { matchResult ->
+            val seconds = matchResult.groupValues[1].toInt()
+            val minutes = seconds / 60
+            val remainingSeconds = seconds % 60
+            " [%02d:%02d]".format(minutes, remainingSeconds)
+        }
+        
+        return formattedOutput
     }
 
     data class DomainConfig(
@@ -594,4 +688,66 @@ fun String.split2ByDash(reverseIfSingle: Boolean = false): Pair<String, String> 
 
 fun String.removeFirstLine(): String {
     return this.lineSequence().drop(1).joinToString("\n")
+}
+
+/**
+ * Validates if a video file is compatible with Telegram's requirements
+ * @param videoFile The video file to validate
+ * @return Pair of Boolean (isValid) and String (errorMessage)
+ */
+private fun validateVideoFile(videoFile: File): Pair<Boolean, String> {
+    if (!videoFile.exists() || !videoFile.isFile) {
+        return false to "File does not exist or is not a regular file"
+    }
+    
+    if (videoFile.length() == 0L) {
+        return false to "File is empty"
+    }
+    
+    // Check file size (Telegram has a 2000MB limit for regular uploads)
+    val fileSizeInBytes = videoFile.length()
+    if (fileSizeInBytes > 2000 * 1024 * 1024) {
+        return false to "File size exceeds Telegram's 2000MB limit (${fileSizeInBytes / (1024.0 * 1024.0)} MB)"
+    }
+    
+    // Check file extension
+    val fileName = videoFile.name.lowercase()
+    if (!fileName.endsWith(".mp4") && !fileName.endsWith(".mov") && !fileName.endsWith(".avi")) {
+        return false to "Unsupported file format: ${videoFile.extension}. Telegram supports MP4, MOV, and AVI"
+    }
+    
+    return true to "File is valid"
+}
+
+/**
+ * Validates if a thumbnail file is compatible with Telegram's requirements
+ * @param thumbnailFile The thumbnail file to validate
+ * @return Pair of Boolean (isValid) and String (errorMessage)
+ */
+private fun validateThumbnailFile(thumbnailFile: File?): Pair<Boolean, String> {
+    if (thumbnailFile == null) {
+        return true to "No thumbnail provided (optional)"
+    }
+    
+    if (!thumbnailFile.exists() || !thumbnailFile.isFile) {
+        return false to "Thumbnail file does not exist or is not a regular file"
+    }
+    
+    if (thumbnailFile.length() == 0L) {
+        return false to "Thumbnail file is empty"
+    }
+    
+    // Check thumbnail size (Telegram recommends thumbnails under 200KB)
+    val thumbnailSizeInBytes = thumbnailFile.length()
+    if (thumbnailSizeInBytes > 200 * 1024) {
+        return false to "Thumbnail size exceeds recommended 200KB limit (${thumbnailSizeInBytes / 1024.0} KB)"
+    }
+    
+    // Check thumbnail format
+    val fileName = thumbnailFile.name.lowercase()
+    if (!fileName.endsWith(".jpg") && !fileName.endsWith(".jpeg") && !fileName.endsWith(".png")) {
+        return false to "Unsupported thumbnail format: ${thumbnailFile.extension}. Telegram supports JPG and PNG"
+    }
+    
+    return true to "Thumbnail is valid"
 }
