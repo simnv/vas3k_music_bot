@@ -37,7 +37,8 @@ class Bot(
     private val telegramClient: TelegramClient,
     private val telegramAllowList: String,
     private val errorNotificationTelegramId: String?,
-    private val ipv6UrlContains: String?
+    private val ipv6UrlContains: String?,
+    private val chunkSizeMB: Int
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
     private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
@@ -179,6 +180,7 @@ class Bot(
     private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long): Boolean {
         var downloadedFile: File? = null
         var thumbnailFile: File? = null
+        var chunkFiles: List<File> = emptyList()
         
         try {
             telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
@@ -202,7 +204,6 @@ class Bot(
                 *downloadParams.toTypedArray()
             ) ?: run {
                 editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download file: empty result")
-                Thread.sleep(5000) // 5 second pause to let user see the error message
                 return false
             }
             
@@ -211,7 +212,6 @@ class Bot(
             if (!isVideoValid) {
                 logger.error("Video validation failed: $videoValidationMessage")
                 editMessageText(chatId, intermediateMessageId, "$message\n❌ Video validation failed: $videoValidationMessage")
-                Thread.sleep(5000)
                 return false
             }
             
@@ -245,7 +245,6 @@ class Bot(
             } catch (e: Exception) {
                 logger.error("Failed to parse video dimensions: $dimensions", e)
                 editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions")
-                Thread.sleep(5000)
                 return false
             }
             
@@ -253,14 +252,34 @@ class Bot(
             var sendVideo = true
             val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
             
+            // Split video into chunks if it's larger than the configured chunk size
+            if (fileSizeInMB > chunkSizeMB) {
+                editMessageText(chatId, intermediateMessageId, "$message\nSplitting video into chunks...")
+                val outputPrefix = "${downloadedFile.parentFile.absolutePath}/${downloadedFile.nameWithoutExtension}_chunk.mp4"
+                chunkFiles = splitVideoIntoChunks(downloadedFile, outputPrefix)
+                
+                if (chunkFiles.isEmpty()) {
+                    logger.error("No chunk files were created")
+                    editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to split video into chunks")
+                    return false
+                }
+                
+                logger.info("Video split into ${chunkFiles.size} chunks")
+            } else {
+                chunkFiles = listOf(downloadedFile)
+            }
+            
+            // Send audio if it's a music chat
             if (idHasMusic) {
                 logger.info("Sending Audio...")
                 editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
                 telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
                 
                 try {
+                    // For audio, we'll use the original file (first chunk)
+                    val audioFile = chunkFiles.first()
                     val audioBuilder = SendAudio.builder()
-                        .audio(InputFile(downloadedFile))
+                        .audio(InputFile(audioFile))
                         .duration(videoDuration)
                         .caption(message.removeFirstLine())
                         .parseMode("HTML")
@@ -281,7 +300,6 @@ class Bot(
                 } catch (e: TelegramApiException) {
                     logger.error("Failed to send audio: ${e.message}", e)
                     editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send audio: ${e.message}")
-                    Thread.sleep(5000)
                     return false
                 }
                 
@@ -292,39 +310,73 @@ class Bot(
                 sendVideo = (totalFreezeDuration / videoCheckFreezeDuration) < 0.5
             }
 
+            // Send video chunks
             if (sendVideo) {
-                editMessageText(chatId, intermediateMessageId, "$message\nSending Video...")
-                logger.info("Sending Video...")
-                telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
-                
-                try {
-                    val videoBuilder = SendVideo.builder()
-                        .video(InputFile(downloadedFile))
-                        .width(videoWidth)
-                        .height(videoHeight)
-                        .duration(videoDuration)
-                        .caption(message)
-                        .parseMode("HTML")
-                        .showCaptionAboveMedia(true)
-                        .supportsStreaming(true)
-                        .disableNotification(true)
-                        .chatId(chatId)
-                        .replyToMessageId(rmid)
+                for ((index, chunkFile) in chunkFiles.withIndex()) {
+                    val chunkNumber = index + 1
+                    val totalChunks = chunkFiles.size
                     
-                    // Only add thumbnail and cover if they exist
-                    thumbnailFile?.let {
-                        videoBuilder.thumbnail(InputFile(it))
-                        videoBuilder.cover(InputFile(it))
+                    // Update status message
+                    val statusMessage = if (totalChunks > 1) {
+                        "$message\nSending Video (Part $chunkNumber of $totalChunks)..."
+                    } else {
+                        "$message\nSending Video..."
                     }
                     
-                    val video = videoBuilder.build()
-                    telegramClient.execute(video)
-                    logger.info("Video sent successfully")
-                } catch (e: TelegramApiException) {
-                    logger.error("Failed to send video: ${e.message}", e)
-                    editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send video: ${e.message}")
-                    Thread.sleep(5000)
-                    return false
+                    editMessageText(chatId, intermediateMessageId, statusMessage)
+                    logger.info("Sending Video chunk $chunkNumber of $totalChunks...")
+                    telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
+                    
+                    try {
+                        // Get dimensions for this chunk
+                        val chunkDimensions = getVideoDimensions(chunkFile)
+                        val (chunkWidth, chunkHeight, chunkDuration) = try {
+                            chunkDimensions.split(",").map { it.toDouble().toInt() }
+                        } catch (e: Exception) {
+                            logger.error("Failed to parse video dimensions for chunk: $chunkDimensions", e)
+                            editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions for chunk $chunkNumber")
+                            return false
+                        }
+                        
+                        // Create caption for this chunk
+                        val chunkCaption = if (totalChunks > 1) {
+                            "$message\n\nPart $chunkNumber of $totalChunks"
+                        } else {
+                            message
+                        }
+                        
+                        val videoBuilder = SendVideo.builder()
+                            .video(InputFile(chunkFile))
+                            .width(chunkWidth)
+                            .height(chunkHeight)
+                            .duration(chunkDuration)
+                            .caption(chunkCaption)
+                            .parseMode("HTML")
+                            .showCaptionAboveMedia(true)
+                            .supportsStreaming(true)
+                            .disableNotification(true)
+                            .chatId(chatId)
+                            .replyToMessageId(rmid)
+                        
+                        // Only add thumbnail and cover if they exist
+                        thumbnailFile?.let {
+                            videoBuilder.thumbnail(InputFile(it))
+                            videoBuilder.cover(InputFile(it))
+                        }
+                        
+                        val video = videoBuilder.build()
+                        telegramClient.execute(video)
+                        logger.info("Video chunk $chunkNumber sent successfully")
+                        
+                        // Add a small delay between sending chunks to avoid rate limiting
+                        if (chunkNumber < totalChunks) {
+                            Thread.sleep(1000)
+                        }
+                    } catch (e: TelegramApiException) {
+                        logger.error("Failed to send video chunk $chunkNumber: ${e.message}", e)
+                        editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send video chunk $chunkNumber: ${e.message}")
+                        return false
+                    }
                 }
             }
 
@@ -332,11 +384,18 @@ class Bot(
         } catch (e: Exception) {
             logger.error("Error in downloadAndSendVideo: ${e.message}", e)
             editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to process video: ${e.message}")
-            Thread.sleep(5000) // 5 second pause to let user see the error message
             return false
         } finally {
             // Clean up files in finally block to ensure they're always deleted
             try {
+                // Delete chunk files (excluding the original downloaded file which will be deleted separately)
+                chunkFiles.forEach { chunkFile ->
+                    if (chunkFile.exists() && chunkFile != downloadedFile) {
+                        chunkFile.delete()
+                        logger.info("Deleted chunk file: ${chunkFile.absolutePath}")
+                    }
+                }
+                
                 downloadedFile?.let { file ->
                     if (file.exists()) {
                         file.delete()
@@ -358,25 +417,12 @@ class Bot(
     private suspend fun processCommands(update: Update, command: String) {
         when (command) {
             "/help" -> sendHelp(update)
-            "/test_error" -> testErrorNotification(update)
         }
     }
 
     private fun sendHelp(update: Update) {
         logger.info("sending help")
         telegramClient.execute(SendMessage(update.message.chatId.toString(), helpMessage))
-    }
-
-    private fun testErrorNotification(update: Update) {
-        logger.info("Testing error notification")
-        try {
-            // Simulate an error to test the notification system
-            throw RuntimeException("This is a test error to verify the error notification system is working correctly")
-        } catch (e: Exception) {
-            errorNotificationService?.sendErrorNotification(e, "Test Command")
-            // Send a confirmation message to the user
-            telegramClient.execute(SendMessage(update.message.chatId.toString(), "Test error notification has been sent to the configured Telegram ID."))
-        }
     }
 
     private val platformOrder = listOf(
@@ -473,16 +519,22 @@ class Bot(
 
     private fun getVideoDimensions(videoFile: File): String {
         logger.info("Running ffprobe for $videoFile...")
-        val command = listOf("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "csv=p=0", videoFile.absolutePath)
+        val command = listOf("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration", "-of", "csv=p=0:s=,", videoFile.absolutePath)
 
         val process = ProcessBuilder(command)
             .redirectErrorStream(true) // Merge error stream with output
             .start()
         val reader = BufferedReader(InputStreamReader(process.inputStream))
-        val output = reader.readLine() // Read first line of output
-        logger.info("Got $output from ffprobe")
+        val lines = reader.readLines()
+        logger.info("Got ${lines.size} lines from ffprobe: $lines")
         process.waitFor()
-        return output
+        
+        // Combine first two lines into one comma-separated line
+        return if (lines.size >= 2) {
+            "${lines[0]},${lines[1]}"
+        } else {
+            lines.firstOrNull() ?: ""
+        }
     }
 
     private fun getTotalFreezeDuration(videoFile: File, startTime: Double, duration: Double): Double {
@@ -659,6 +711,54 @@ class Bot(
         return output
     }
 
+    /**
+     * Splits a video file into chunks using mkvmerge
+     * @param videoFile The video file to split
+     * @param outputPrefix The prefix for output chunk files
+     * @param chunkSizeMB The maximum size of each chunk in MB
+     * @return List of chunk files
+     */
+    private fun splitVideoIntoChunks(videoFile: File, outputPrefix: String, chunkSizeMB: Int = this.chunkSizeMB): List<File> {
+        logger.info("Splitting video file ${videoFile.absolutePath} into chunks of ${chunkSizeMB}MB...")
+        
+        val command = listOf(
+            "mkvmerge",
+            "-o", outputPrefix,
+            "--split", "${chunkSizeMB}M",
+            videoFile.absolutePath
+        )
+        
+        logger.info("Executing command: ${command.joinToString(" ")}")
+        
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .start()
+        
+        // Read and log output
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                logger.info("mkvmerge: $line")
+            }
+        }
+        
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            logger.error("mkvmerge failed with exit code $exitCode")
+            throw RuntimeException("Failed to split video file using mkvmerge")
+        }
+        
+        // Find all chunk files
+        val outputDir = videoFile.parentFile
+        val chunkPrefix = File(outputPrefix).nameWithoutExtension
+        logger.info("Looking for chunk files with prefix: $chunkPrefix in directory: ${outputDir.absolutePath}")
+        val chunkFiles = outputDir.listFiles { _, name -> name.startsWith(chunkPrefix) }?.toList() ?: emptyList()
+        
+        logger.info("Created ${chunkFiles.size} chunk files")
+        chunkFiles.forEach { file -> logger.info("Chunk file: ${file.absolutePath}") }
+        
+        return chunkFiles.sortedBy { it.name }
+    }
+
     private fun editMessageText(chatId: Long, messageId: Int, newText: String) {
         val editMessage = EditMessageText.builder()
             .chatId(chatId.toString())
@@ -704,11 +804,11 @@ private fun validateVideoFile(videoFile: File): Pair<Boolean, String> {
         return false to "File is empty"
     }
     
-    // Check file size (Telegram has a 2000MB limit for regular uploads)
-    val fileSizeInBytes = videoFile.length()
-    if (fileSizeInBytes > 2000 * 1024 * 1024) {
-        return false to "File size exceeds Telegram's 2000MB limit (${fileSizeInBytes / (1024.0 * 1024.0)} MB)"
-    }
+    // // Check file size (Telegram has a 2000MB limit for regular uploads)
+    // val fileSizeInBytes = videoFile.length()
+    // if (fileSizeInBytes > 2000 * 1024 * 1024) {
+    //     return false to "File size exceeds Telegram's 2000MB limit (${fileSizeInBytes / (1024.0 * 1024.0)} MB)"
+    // }
     
     // Check file extension
     val fileName = videoFile.name.lowercase()

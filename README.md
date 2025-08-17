@@ -8,6 +8,7 @@ A Telegram bot that processes music links and downloads videos/audio from variou
 - **Video/Audio downloading** from YouTube, TikTok, VK, RuTube
 - **Smart content detection** - automatically sends audio for music-focused chats
 - **Freeze detection** - analyzes video content to determine should we send video
+- **Video chunking** - automatically splits large videos into smaller chunks for Telegram
 - **Allow list system** - restricts bot usage to authorized chats
 - **Error notifications** - sends error reports to configured Telegram ID
 - **IPv6/IPv4 support** - configurable IP version for downloads
@@ -50,6 +51,9 @@ ERROR_NOTIFICATION_TELEGRAM_ID=your_telegram_user_id
 
 # Optional: IPv6 URL handling
 IPV6_URL_CONTAINS=youtube.com,youtu.be
+
+# Optional: Video chunk size in MB (default: 49)
+CHUNK_SIZE_MB=49
 ```
 
 ### 4. Telegram Bot Creation Steps
@@ -101,6 +105,9 @@ This project uses a local Telegram Bot API server (aiogram/telegram-bot-api) for
    TELEGRAM_BASE_SCHEMA=http
    TELEGRAM_BASE_URL=tgbot-api
    TELEGRAM_BASE_PORT=8081
+
+   # You can set bigger file size with local Telegram Bot API
+   CHUNK_SIZE_MB=1800
    ```
 
 3. **Understanding the Telegram Bot API configuration**:
@@ -213,20 +220,21 @@ make redeploy-prod
 
 ## Environment Variables Reference
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TELEGRAM_API_TOKEN` | Yes | Bot token from @BotFather |
-| `TELEGRAM_BOT_USERNAME` | Yes | Bot username (without @) |
-| `TELEGRAM_ALLOW_LIST` | Yes | Allow list of chat ids and their names |
-| `ERROR_NOTIFICATION_TELEGRAM_ID` | No | User ID for error notifications |
-| `IPV6_URL_CONTAINS` | No | Comma-separated domains for IPv6 |
-| `YTDL_LOCATION` | Auto | yt-dlp binary location (set by Docker) |
-| `TELEGRAM_API_ID` | Yes | API ID from my.telegram.org |
-| `TELEGRAM_API_HASH` | Yes | API hash from my.telegram.org |
-| `TELEGRAM_LOCAL` | Yes | Set to 1 to use local Bot API server |
-| `TELEGRAM_BASE_SCHEMA` | Yes | Protocol for local Bot API (http/https) |
-| `TELEGRAM_BASE_URL` | Yes | Hostname of local Bot API server |
-| `TELEGRAM_BASE_PORT` | Yes | Port for local Bot API server |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TELEGRAM_API_TOKEN` | Yes | - | Bot token from @BotFather |
+| `TELEGRAM_BOT_USERNAME` | Yes | - | Bot username (without @) |
+| `TELEGRAM_ALLOW_LIST` | Yes | - | Allow list of chat ids and their names |
+| `ERROR_NOTIFICATION_TELEGRAM_ID` | No | - | User ID for error notifications |
+| `IPV6_URL_CONTAINS` | No | - | Comma-separated domains for IPv6 |
+| `CHUNK_SIZE_MB` | No | 50 | Video chunk size in MB for splitting large files |
+| `YTDL_LOCATION` | No | `/usr/local/bin/yt-dlp` | yt-dlp binary location |
+| `TELEGRAM_API_ID` | Yes | - | API ID from my.telegram.org |
+| `TELEGRAM_API_HASH` | Yes | - | API hash from my.telegram.org |
+| `TELEGRAM_LOCAL` | No | - | Set to 1 to use local Bot API server |
+| `TELEGRAM_BASE_SCHEMA` | No | `https` | Protocol for Bot API (http/https) |
+| `TELEGRAM_BASE_URL` | No | `api.telegram.org` | Hostname of Bot API server |
+| `TELEGRAM_BASE_PORT` | No | `443` | Port for Bot API server |
 
 ## Docker Configuration
 
@@ -286,7 +294,6 @@ mvn package -DskipTests
 ## Bot Commands
 
 - `/help` - Show help message
-- `/test_error` - Test error notification system
 
 ## Supported Platforms
 
@@ -328,12 +335,11 @@ docker-compose logs -f tgbot-api
 
 ### Error Notifications
 
-If configured, the bot sends error notifications to the specified Telegram user ID. Use `/test_error` command to verify the notification system.
+If configured, the bot sends error notifications to the specified Telegram user ID.
 
 ## Architecture
 
 - **Kotlin/JVM**: Main application language
-- **Ktor**: HTTP server for Spotify OAuth
 - **Telegram Bots API**: Bot framework
 - **yt-dlp**: Video/audio downloading
 - **FFmpeg**: Media processing and analysis
