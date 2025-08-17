@@ -2,7 +2,6 @@ package dev.storozhenko.music
 
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.run.Bot
-
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 import org.telegram.telegrambots.meta.TelegramUrl
@@ -14,7 +13,6 @@ import okhttp3.Response
 
 private val botToken = getEnv("TELEGRAM_API_TOKEN")
 private val botUsername = getEnv("TELEGRAM_BOT_USERNAME")
-
 private val telegramBaseSchema = getEnv("TELEGRAM_BASE_SCHEMA")
 private val telegramBaseURL = getEnv("TELEGRAM_BASE_URL")
 private val telegramBasePort = getEnv("TELEGRAM_BASE_PORT").toInt()
@@ -71,8 +69,6 @@ class RetryInterceptor(private val maxRetries: Int) : Interceptor {
 
 fun main() {
     val telegramBotsApi = TelegramBotsLongPollingApplication()
-
-
     val telegramURL = TelegramUrl(telegramBaseSchema, telegramBaseURL, telegramBasePort, false)
     val httpClient = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS) // Connection timeout
