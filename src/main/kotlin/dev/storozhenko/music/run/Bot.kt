@@ -166,14 +166,16 @@ class Bot(
             val validurl = validLinks.first().text
             downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId)
         } else {
-            true // No video to download, consider it a success
+            // No video to download, but we have Odesli information
+            // Keep the text message with Odesli information
+            false
         }
 
         if (success) {
             logger.info("Deleting intermediate text message $tmId")
             telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
         } else {
-            logger.info("Not deleting intermediate text message $tmId due to processing failure")
+            logger.info("Not deleting intermediate text message $tmId - keeping Odesli information")
         }
     }
 
