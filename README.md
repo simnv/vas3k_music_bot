@@ -2,6 +2,8 @@
 
 A Telegram bot that processes music links and downloads videos/audio from various platforms. The bot uses [Odesli API](https://odesli.co/) to parse music links and provides unified access to tracks across multiple streaming platforms.
 
+Based on the original project by [AngryJKirk](https://github.com/AngryJKirk/vas3k_music_bot)
+
 ## Features
 
 - **Multi-platform music link parsing** via Odesli API (Spotify, YouTube, Apple Music, etc.)
