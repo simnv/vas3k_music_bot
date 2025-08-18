@@ -2,42 +2,83 @@ package dev.storozhenko.music.run
 
 import dev.storozhenko.music.OdesilResponse
 import dev.storozhenko.music.getLogger
+import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.OdesilService
-import dev.storozhenko.music.services.SpotifyService
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlin.time.Duration.Companion.minutes
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
+import org.telegram.telegrambots.meta.api.methods.send.SendChatAction
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage
+import org.telegram.telegrambots.meta.api.methods.ActionType
 import org.telegram.telegrambots.meta.api.objects.MessageEntity
 import org.telegram.telegrambots.meta.api.objects.Update
 import org.telegram.telegrambots.meta.generics.TelegramClient
+import org.telegram.telegrambots.meta.api.methods.send.SendVideo
+import org.telegram.telegrambots.meta.api.methods.send.SendAudio
+import org.telegram.telegrambots.meta.api.objects.InputFile
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException
+import java.io.File
+import java.util.UUID
+import org.jsoup.Jsoup
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.URL
 
 class Bot(
     private val botName: String,
-    private val spotifyService: SpotifyService,
-    private val telegramClient: TelegramClient
+    private val ytdlLocation: String,
+    private val telegramClient: TelegramClient,
+    private val telegramAllowList: String,
+    private val errorNotificationTelegramId: String?,
+    private val ipv6UrlContains: String?,
+    private val chunkSizeMB: Int
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
+    private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
     private val odesilService = OdesilService()
     val handler = CoroutineExceptionHandler { _, exception ->
         logger.error("Caught exception: $exception")
+        errorNotificationService?.sendErrorNotification(exception)
     }
     private val coroutine = CoroutineScope(Dispatchers.IO + SupervisorJob() + handler)
     private val helpMessage = getResource("help_message.txt")
-    private val chatsAndPlaylistNames = getResource("allow_list.txt")
-        .split("\n")
-        .map { line -> line.split(" ") }
+    private val chatsAndPlaylistNames = telegramAllowList
+        .split(",")
+        .map { line -> line.split(":") }
         .associate { (id, prefix) -> id.toLong() to prefix }
+    private val fileDeleteScope = CoroutineScope(Dispatchers.Default)
+    private val processorScope = CoroutineScope(Dispatchers.Default)
+    
+    private fun getIpVersionParam(url: String): String? {
+        if (ipv6UrlContains.isNullOrEmpty()) {
+            return null
+        }
+        
+        val urlContainsList = ipv6UrlContains.split(",").map { it.trim() }
+        return if (urlContainsList.any { url.contains(it, ignoreCase = true) }) {
+            "-6"
+        } else {
+            "-4"
+        }
+    }
 
     override fun consume(updates: MutableList<Update>) {
         logger.info("Got ${updates.size} updates")
         updates.forEach {
-            runCatching { consume(it) }
-                .onFailure { e -> logger.error("Can not process update $it", e) }
+            processorScope.launch {
+                runCatching { consume(it) }
+                    .onFailure { e ->
+                        logger.error("Can not process update $it", e)
+                        errorNotificationService?.sendUpdateProcessingErrorNotification(e)
+                    }
+            }
         }
     }
 
@@ -49,23 +90,13 @@ class Bot(
 
         val chatId = update.message.chatId
         if (chatId !in chatsAndPlaylistNames) {
-            logger.info("Got an update from unauthorized chat")
+            logger.info("Got an update from unauthorized chat $chatId")
             return
         }
 
         if (!update.message.hasEntities()) {
             logger.info("Got an update with no entities")
             return
-        }
-
-        if (!spotifyService.isReady()) {
-            logger.info("Spotify service is not ready")
-            telegramClient.execute(
-                SendMessage(
-                    chatId.toString(),
-                    "Нет авторизации в spotify, пните разраба"
-                )
-            )
         }
 
         val entities = update.message.entities
@@ -78,68 +109,315 @@ class Bot(
                     processCommands(update, command)
                 }.onFailure {
                     logger.error("Can't process command for $update", it)
+                    errorNotificationService?.sendCommandErrorNotification(it, command)
                 }
             }
             return
         }
 
+        telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
         var initialMessage = update.message.text
         val links = entities
             .filter { entity -> entity.type == "url" }
             .mapNotNull(odesilService::detect)
             .mapIndexed { index, odesilEntity ->
-                initialMessage = initialMessage.replace(
-                    odesilEntity.messageEntity.text,
-                    "[${index + 1}]"
-                )
-                updatePlaylist(entities, chatId, odesilEntity.odesilResponse)
                 mapOdesilResponse(odesilEntity.odesilResponse)
             }
+        val validLinks = entities
+            .filter { entity -> entity.type == "url" && isValidDownloadUrl(entity.text) }
 
-
-        if (links.isEmpty()) {
-            logger.info("No links from Odesil, returning")
+        if (links.isEmpty() && validLinks.isEmpty()) {
+            logger.info("No links from Odesil or valid video services, returning")
             return
         }
 
         val from = update.message.from.userName
         val fromId = update.message.from.id
-        val linksMessage = if (links.size == 1) {
-            links.first()
-        } else {
-            links.mapIndexed { index, l -> "${index + 1}. $l" }.joinToString(separator = "\n\n")
+        lateinit var linksMessage: String
+        if (!links.isEmpty()) {
+            linksMessage = if (links.size == 1) {
+                links.first()
+            } else {
+                links.mapIndexed { index, l -> "${index + 1}. $l" }.joinToString(separator = "\n\n")
+            }
+        } else if (!validLinks.isEmpty()) {
+            val validLink = validLinks.first()
+            val videoTitle = getVideoTitle(validLink.text)
+            linksMessage = "$videoTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
         }
 
-        initialMessage = initialMessage.takeIf { it != "[1]" } ?: ""
-        val message =
-            "<b><a href=\"tg://user?id=$fromId\">@$from</a></b> написал(а): $initialMessage\n\n$linksMessage"
+        val message = "$linksMessage"
 
         logger.info("Sending message: $message")
-        telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true) })
-        logger.info("Deleting original message ${update.message.messageId}")
-        telegramClient.execute(DeleteMessage(chatId.toString(), update.message.messageId))
+        // Send message with source info to error notification service
+        val authorUsername = update.message.from?.userName
+        val authorName = update.message.from?.firstName + (update.message.from?.lastName?.let { " $it" } ?: "")
+        val chatTitle = update.message.chat.title ?: "Private Chat"
+        errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle)
+
+        val replyToMessageId = update.message.getMessageId()
+        val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview(); disableNotification() })
+        val tmId = textMessage.messageId
+
+        val yturl = extractFirstUrlByText(message, "Youtube")
+        val success = if (yturl != null) {
+            downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId)
+        } else if (!validLinks.isEmpty()) {
+            val validurl = validLinks.first().text
+            downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId)
+        } else {
+            // No video to download, but we have Odesli information
+            // Keep the text message with Odesli information
+            false
+        }
+
+        if (success) {
+            logger.info("Deleting intermediate text message $tmId")
+            telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
+        } else {
+            logger.info("Not deleting intermediate text message $tmId - keeping Odesli information")
+        }
     }
 
-    private fun updatePlaylist(entities: List<MessageEntity>, chatId: Long, odesilResponse: OdesilResponse) {
-        coroutine.launch {
-            runCatching {
-                logger.info("Updating playlist for $odesilResponse")
-                val addEntireAlbum = entities
-                    .any { it.type == "hashtag" && it.text == "#вплейлист" }
-                spotifyService.updatePlaylist(
-                    getPlaylistNamePrefix(chatId),
-                    odesilResponse,
-                    addEntireAlbum
-                )
+    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long): Boolean {
+        var downloadedFile: File? = null
+        var thumbnailFile: File? = null
+        var chunkFiles: List<File> = emptyList()
+        
+        try {
+            telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
+            editMessageText(chatId, intermediateMessageId, "$message\nDownloading...")
+            val ipVersionParam = getIpVersionParam(url)
+            val downloadParams = mutableListOf<String>().apply {
+                ipVersionParam?.let { add(it) }
+                addAll(listOf(
+                    "--cookies", "/cookies.txt",
+                    "-t", "mp4",
+                    "-I", "0",
+                    "--playlist-items", "1",
+                    "--write-thumbnail",
+                    "--embed-thumbnail",
+                    "--convert-thumbnails", "jpg"
+                ))
             }
-                .onFailure { logger.error("Failed to update playlist:", it) }
+            downloadedFile = download(
+                "${UUID.randomUUID()}.%(ext)s",
+                url,
+                *downloadParams.toTypedArray()
+            ) ?: run {
+                editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download file: empty result")
+                return false
+            }
+            
+            // Validate downloaded file
+            val (isVideoValid, videoValidationMessage) = validateVideoFile(downloadedFile)
+            if (!isVideoValid) {
+                logger.error("Video validation failed: $videoValidationMessage")
+                editMessageText(chatId, intermediateMessageId, "$message\n❌ Video validation failed: $videoValidationMessage")
+                return false
+            }
+            
+            // Log file size
+            val fileSizeInBytes = downloadedFile.length()
+            val fileSizeInMB = fileSizeInBytes / (1024.0 * 1024.0)
+            logger.info("Downloaded file size: ${String.format("%.2f", fileSizeInMB)} MB (${fileSizeInBytes} bytes)")
+            
+            thumbnailFile = downloadedFile.changeExtension("jpg")
+            if (!thumbnailFile.exists()) {
+                logger.warn("Thumbnail file does not exist: ${thumbnailFile.absolutePath}")
+                // Create a placeholder thumbnail or continue without it
+                thumbnailFile = null
+            } else {
+                // Validate thumbnail file
+                val (isThumbnailValid, thumbnailValidationMessage) = validateThumbnailFile(thumbnailFile)
+                if (!isThumbnailValid) {
+                    logger.warn("Thumbnail validation failed: $thumbnailValidationMessage. Continuing without thumbnail.")
+                    thumbnailFile = null
+                } else {
+                    delayedDelete(thumbnailFile)
+                }
+            }
+            
+            editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
+            val dimensions = getVideoDimensions(downloadedFile)
+            logger.info("Video dimensions: $dimensions")
+            
+            val (videoWidth, videoHeight, videoDuration) = try {
+                dimensions.split(",").map { it.toDouble().toInt() }
+            } catch (e: Exception) {
+                logger.error("Failed to parse video dimensions: $dimensions", e)
+                editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions")
+                return false
+            }
+            
+            val (artist, title) = message.lineSequence().first().split2ByDash(true)
+            var sendVideo = true
+            val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
+            
+            // Split video into chunks if it's larger than the configured chunk size
+            if (fileSizeInMB > chunkSizeMB) {
+                editMessageText(chatId, intermediateMessageId, "$message\nSplitting video into chunks...")
+                val outputPrefix = "${downloadedFile.parentFile.absolutePath}/${downloadedFile.nameWithoutExtension}_chunk.mp4"
+                chunkFiles = splitVideoIntoChunks(downloadedFile, outputPrefix)
+                
+                if (chunkFiles.isEmpty()) {
+                    logger.error("No chunk files were created")
+                    editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to split video into chunks")
+                    return false
+                }
+                
+                logger.info("Video split into ${chunkFiles.size} chunks")
+            } else {
+                chunkFiles = listOf(downloadedFile)
+            }
+            
+            // Send audio if it's a music chat
+            if (idHasMusic) {
+                logger.info("Sending Audio...")
+                editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
+                telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
+                
+                try {
+                    // For audio, we'll use the original file (first chunk)
+                    val audioFile = chunkFiles.first()
+                    val audioBuilder = SendAudio.builder()
+                        .audio(InputFile(audioFile))
+                        .duration(videoDuration)
+                        .caption(message.removeFirstLine())
+                        .parseMode("HTML")
+                        .disableNotification(true)
+                        .performer(artist)
+                        .title(title)
+                        .chatId(chatId)
+                        .replyToMessageId(rmid)
+                    
+                    // Only add thumbnail if it exists
+                    thumbnailFile?.let {
+                        audioBuilder.thumbnail(InputFile(it))
+                    }
+                    
+                    val audio = audioBuilder.build()
+                    val audioMessage = telegramClient.execute(audio)
+                    logger.info("Audio sent successfully")
+                } catch (e: TelegramApiException) {
+                    logger.error("Failed to send audio: ${e.message}", e)
+                    editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send audio: ${e.message}")
+                    return false
+                }
+                
+                editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
+                val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
+                val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
+                logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
+                sendVideo = (totalFreezeDuration / videoCheckFreezeDuration) < 0.5
+            }
+
+            // Send video chunks
+            if (sendVideo) {
+                for ((index, chunkFile) in chunkFiles.withIndex()) {
+                    val chunkNumber = index + 1
+                    val totalChunks = chunkFiles.size
+                    
+                    // Update status message
+                    val statusMessage = if (totalChunks > 1) {
+                        "$message\nSending Video (Part $chunkNumber of $totalChunks)..."
+                    } else {
+                        "$message\nSending Video..."
+                    }
+                    
+                    editMessageText(chatId, intermediateMessageId, statusMessage)
+                    logger.info("Sending Video chunk $chunkNumber of $totalChunks...")
+                    telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
+                    
+                    try {
+                        // Get dimensions for this chunk
+                        val chunkDimensions = getVideoDimensions(chunkFile)
+                        val (chunkWidth, chunkHeight, chunkDuration) = try {
+                            chunkDimensions.split(",").map { it.toDouble().toInt() }
+                        } catch (e: Exception) {
+                            logger.error("Failed to parse video dimensions for chunk: $chunkDimensions", e)
+                            editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions for chunk $chunkNumber")
+                            return false
+                        }
+                        
+                        // Create caption for this chunk
+                        val chunkCaption = if (totalChunks > 1) {
+                            "$message\n\nPart $chunkNumber of $totalChunks"
+                        } else {
+                            message
+                        }
+                        
+                        val videoBuilder = SendVideo.builder()
+                            .video(InputFile(chunkFile))
+                            .width(chunkWidth)
+                            .height(chunkHeight)
+                            .duration(chunkDuration)
+                            .caption(chunkCaption)
+                            .parseMode("HTML")
+                            .showCaptionAboveMedia(true)
+                            .supportsStreaming(true)
+                            .disableNotification(true)
+                            .chatId(chatId)
+                            .replyToMessageId(rmid)
+                        
+                        // Only add thumbnail and cover if they exist
+                        thumbnailFile?.let {
+                            videoBuilder.thumbnail(InputFile(it))
+                            videoBuilder.cover(InputFile(it))
+                        }
+                        
+                        val video = videoBuilder.build()
+                        telegramClient.execute(video)
+                        logger.info("Video chunk $chunkNumber sent successfully")
+                        
+                        // Add a small delay between sending chunks to avoid rate limiting
+                        if (chunkNumber < totalChunks) {
+                            Thread.sleep(1000)
+                        }
+                    } catch (e: TelegramApiException) {
+                        logger.error("Failed to send video chunk $chunkNumber: ${e.message}", e)
+                        editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send video chunk $chunkNumber: ${e.message}")
+                        return false
+                    }
+                }
+            }
+
+            return true
+        } catch (e: Exception) {
+            logger.error("Error in downloadAndSendVideo: ${e.message}", e)
+            editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to process video: ${e.message}")
+            return false
+        } finally {
+            // Clean up files in finally block to ensure they're always deleted
+            try {
+                // Delete chunk files (excluding the original downloaded file which will be deleted separately)
+                chunkFiles.forEach { chunkFile ->
+                    if (chunkFile.exists() && chunkFile != downloadedFile) {
+                        chunkFile.delete()
+                        logger.info("Deleted chunk file: ${chunkFile.absolutePath}")
+                    }
+                }
+                
+                downloadedFile?.let { file ->
+                    if (file.exists()) {
+                        file.delete()
+                        logger.info("Deleted downloaded file: ${file.absolutePath}")
+                    }
+                }
+                thumbnailFile?.let { file ->
+                    if (file.exists()) {
+                        file.delete()
+                        logger.info("Deleted thumbnail file: ${file.absolutePath}")
+                    }
+                }
+            } catch (e: Exception) {
+                logger.error("Error cleaning up files: ${e.message}", e)
+            }
         }
     }
 
     private suspend fun processCommands(update: Update, command: String) {
         when (command) {
-            "/current_playlist" -> sendCurrentPlaylist(update)
-            "/all_playlists" -> sendAllPlaylists(update)
             "/help" -> sendHelp(update)
         }
     }
@@ -149,56 +427,16 @@ class Bot(
         telegramClient.execute(SendMessage(update.message.chatId.toString(), helpMessage))
     }
 
-    private suspend fun sendCurrentPlaylist(update: Update) {
-        logger.info("sending current playlist")
-        val chatId = update.message.chatId
-        val playlist = spotifyService.getCurrentPlaylist(getPlaylistNamePrefix(chatId))
-        telegramClient.execute(
-            SendMessage(
-                chatId.toString(), "<a href=\"${playlist.url}\">${playlist.name}</a>"
-            ).apply {
-                replyToMessageId = update.message.messageId
-                enableHtml(true)
-            }
-        )
-    }
-
-    private suspend fun sendAllPlaylists(update: Update) {
-        logger.info("sending all playlists")
-        val playlistNamePrefix = getPlaylistNamePrefix(update.message.chatId)
-        val playlists = spotifyService.getAllPlaylists(playlistNamePrefix)
-        val message = playlists.mapIndexed { i, p ->
-            "${i + 1}. <a href=\"${p.url}\">${p.name}</a>"
-        }.joinToString(separator = "\n")
-        telegramClient.execute(
-            SendMessage(
-                update.message.chatId.toString(), message
-            ).apply {
-                enableHtml(true)
-                disableWebPagePreview()
-                replyToMessageId = update.message.messageId
-            }
-        )
-    }
-
     private val platformOrder = listOf(
-        "spotify" to "Spotify",
         "yandex" to "Yandex.Music",
+        "youtube" to "YouTube",
+        // "youtubeMusic" to "YouTube Music",
         "appleMusic" to "Apple Music",
         "itunes" to "iTunes",
-        "youtube" to "YouTube",
-        "youtubeMusic" to "YouTube Music",
+        "spotify" to "Spotify",
         "google" to "Google",
         "googleStore" to "Google Store",
-        "pandora" to "Pandora",
-        "deezer" to "Deezer",
-        "tidal" to "Tidal",
-        "amazonStore" to "Amazon Store",
-        "amazonMusic" to "Amazon Music",
-        "soundcloud" to "SoundCloud",
-        "napster" to "Napster",
-        "spinrilla" to "Spinrilla",
-        "audius" to "Audius"
+        "soundcloud" to "SoundCloud"
     )
 
     private fun mapOdesilResponse(odesilResponse: OdesilResponse): String {
@@ -211,11 +449,6 @@ class Bot(
         val songName = "$artistName - $title\n"
         return songName + platforms.joinToString(separator = " | ")
         { (platformName, platformData) -> "<a href=\"${platformData.url}\">${platformName}</a>" }
-    }
-
-    private fun getPlaylistNamePrefix(chatId: Long): String {
-        return chatsAndPlaylistNames[chatId]
-            ?: throw IllegalStateException("Playlist name is not found for chat $chatId")
     }
 
     private fun getCommand(entities: List<MessageEntity>): String? {
@@ -231,4 +464,392 @@ class Bot(
         return this::class.java.classLoader.getResource(name)?.readText()
             ?: throw IllegalStateException("Resource $name is not found")
     }
+
+    private fun downloadVideo(url: String, vararg params: String): File? {
+        return download("${UUID.randomUUID()}.%(ext)s", url, *params)
+    }
+
+    private fun downloadAudio(url: String, vararg params: String): File? {
+        return download("%(title)s.%(ext)s", url, "-x", "--audio-format", "mp3", "--no-playlist", *params)
+    }
+
+    private fun delayedDelete(fileToDelete: File) {
+        fileToDelete.deleteOnExit()
+        fileDeleteScope.launch {
+            runCatching {
+                delay(55.minutes)
+                fileToDelete.delete()
+                logger.info("${fileToDelete.absolutePath} is deleted")
+            }.onFailure {
+                logger.error("Could not delete ${fileToDelete.absolutePath}")
+                errorNotificationService?.sendErrorNotification(it, "File Deletion: ${fileToDelete.absolutePath}")
+            }
+        }
+    }
+
+    private fun download(filename: String, url: String, vararg params: String): File? {
+        logger.info("Running yt-dlp for $url...")
+        val folderName = UUID.randomUUID().toString()
+        val folder = File("/tmp", folderName).apply { mkdir() }
+        logger.info(params.joinToString(" "))
+        val process =
+            ProcessBuilder(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename", *params).start()
+        process.inputStream.reader(Charsets.UTF_8).use { logger.info(it.readText()) }
+        process.waitFor()
+        logger.info("Finished running yt-dlp for $url")
+        val files = folder.listFiles()
+        if (files == null || files.isEmpty()) {
+            logger.error("Can't download file for url $url")
+            return null
+        }
+        var downloadedFile = files.first()
+        downloadedFile = downloadedFile.changeExtension("mp4")
+        delayedDelete(downloadedFile)
+        return downloadedFile
+    }
+
+    private fun extractFirstUrlByText(html: String, linkText: String): String? {
+        val doc = Jsoup.parse(html)
+        val element = doc.select("a:containsOwn($linkText)").first()
+        return element?.attr("href")
+    }
+
+    private fun File.changeExtension(newExtension: String): File {
+        val newName = "${this.nameWithoutExtension}.$newExtension"
+        return this.resolveSibling(newName)
+    }
+
+    private fun getVideoDimensions(videoFile: File): String {
+        logger.info("Running ffprobe for $videoFile...")
+        val command = listOf("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration", "-of", "csv=p=0:s=,", videoFile.absolutePath)
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true) // Merge error stream with output
+            .start()
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val lines = reader.readLines()
+        logger.info("Got ${lines.size} lines from ffprobe: $lines")
+        process.waitFor()
+        
+        // Combine first two lines into one comma-separated line
+        return if (lines.size >= 2) {
+            "${lines[0]},${lines[1]}"
+        } else {
+            lines.firstOrNull() ?: ""
+        }
+    }
+
+    private fun getTotalFreezeDuration(videoFile: File, startTime: Double, duration: Double): Double {
+        logger.info("Running ffmpeg for $videoFile to find freezes...")
+        val command = listOf(
+            "ffmpeg",
+            "-v", "error",
+            "-i", videoFile.absolutePath,
+            "-ss", startTime.toInt().toString(),
+            "-t", duration.toInt().toString(),
+            "-vf", "freezedetect=n=-60dB:d=1,metadata=mode=print:file=-",
+            "-map", "0:v:0",
+            "-f", "null",
+            "-"
+        )
+        logger.info(command.joinToString(" "))
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .start()
+
+        var totalFreezeDuration = 0.0
+        val freezeDurationPattern = Regex("lavfi\\.freezedetect\\.freeze_duration=(\\d+\\.?\\d*)")
+
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                logger.info(line)
+                
+                // Check for freeze duration and add to total
+                freezeDurationPattern.find(line)?.let { match ->
+                    totalFreezeDuration += match.groupValues[1].toDouble()
+                }
+            }
+        }
+
+        process.waitFor()
+        logger.info("Total Freeze Duration: $totalFreezeDuration")
+        return totalFreezeDuration
+    }
+
+    private fun getVideoTitle(url: String): String {
+        logger.info("Running yt-dlp to get title and duration for $url...")
+        val ipVersionParam = getIpVersionParam(url)
+        val command = mutableListOf<String>().apply {
+            addAll(listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s [%(duration)s]"))
+            ipVersionParam?.let { add(it) }
+            add(url)
+        }
+        logger.info(command.joinToString(" "))
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true) // Merge error stream with output
+            .start()
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val output = reader.readLine() // Read first line of output
+        logger.info("Got $output from yt-dlp")
+        process.waitFor()
+        if (output.contains(": No video formats found!")) {
+            return ""
+        }
+        
+        // Format the duration from seconds to MM:SS
+        val formattedOutput = output.replace(Regex("\\[(\\d+)\\]")) { matchResult ->
+            val seconds = matchResult.groupValues[1].toInt()
+            val minutes = seconds / 60
+            val remainingSeconds = seconds % 60
+            " [%02d:%02d]".format(minutes, remainingSeconds)
+        }
+        
+        return formattedOutput
+    }
+
+    data class DomainConfig(
+        val hosts: Set<String>, // exact host names
+        val allowedPaths: Set<String>, // path must start with one of these
+        val blockedPathPrefixes: Set<String> = emptySet(),
+        val extraPathTokens: Set<String> = emptySet()
+    )
+
+    private val VALID_URL_CONFIG = mapOf(
+        "youtube" to DomainConfig(
+            hosts = setOf("youtube.com", "youtu.be"),
+            allowedPaths = setOf("/watch", "/shorts/", "/embed/", "/v/", "/"),
+            blockedPathPrefixes = setOf("/post/")
+        ),
+
+        "tiktok" to DomainConfig(
+            hosts = setOf("tiktok.com", "vt.tiktok.com"),
+            allowedPaths = setOf("/"),
+            blockedPathPrefixes = emptySet()
+        ),
+
+        "vk" to DomainConfig(
+            hosts = setOf("vk.com", "vk.ru", "vkvideo.ru"),
+            allowedPaths = setOf("/video", "/clip"),
+            blockedPathPrefixes = emptySet(),
+            extraPathTokens = setOf("/video-", "/clip-")
+        ),
+
+        "rutube" to DomainConfig(
+            hosts = setOf("rutube.ru"),
+            allowedPaths = setOf("/video"),
+            blockedPathPrefixes = emptySet()
+        )
+    )
+
+    private fun isValidDownloadUrl(urlString: String): Boolean =
+        runCatching {
+            logger.info("Validating URL: $urlString")
+            val url = URL(urlString)
+            val host = url.host.lowercase()
+            val path = url.path.lowercase()
+            logger.info("Parsed URL - host: $host, path: $path")
+
+            // Find the first config whose host matches (exact or sub-domain)
+            val cfg = VALID_URL_CONFIG.values.firstOrNull { cfg ->
+                val hostMatches = cfg.hosts.any { exact ->
+                    val matches = host == exact || host.endsWith(".$exact")
+                    if (matches) {
+                        logger.info("Host '$host' matches config for '$exact'")
+                    }
+                    matches
+                }
+                hostMatches
+            } ?: run {
+                logger.info("No config found for host: $host")
+                return false
+            }
+
+            logger.info("Using config with hosts: ${cfg.hosts}, allowedPaths: ${cfg.allowedPaths}, blockedPathPrefixes: ${cfg.blockedPathPrefixes}, extraPathTokens: ${cfg.extraPathTokens}")
+
+            // 1. Reject blocked prefixes
+            val blockedPrefix = cfg.blockedPathPrefixes.find { path.startsWith(it) }
+            if (blockedPrefix != null) {
+                logger.info("URL rejected: path '$path' starts with blocked prefix '$blockedPrefix'")
+                return false
+            }
+
+            // 2. Accept explicit allowed prefixes
+            val allowedPrefix = cfg.allowedPaths.find { path.startsWith(it) }
+            if (allowedPrefix != null) {
+                logger.info("URL accepted: path '$path' starts with allowed prefix '$allowedPrefix'")
+                return true
+            }
+
+            // 3. Accept extra in-path tokens (VK-style "/video-123", etc.)
+            val extraToken = cfg.extraPathTokens.find { path.contains(it) }
+            if (extraToken != null) {
+                logger.info("URL accepted: path '$path' contains extra token '$extraToken'")
+                return true
+            }
+
+            logger.info("URL rejected: path '$path' doesn't match any allowed patterns")
+            false
+        }.getOrElse { exception ->
+            logger.error("Error validating URL '$urlString': ${exception.message}", exception)
+            false
+        }
+
+    private fun splitAudioAndVideo(videoFile: File, videoFileName: String, audioFileName: String): String {
+        logger.info("Running ffmpeg for splitting $videoFile...")
+        val command = listOf("ffmpeg", "-i", videoFile.absolutePath,
+            "-v", "error",
+            "-an", "-c:v", "copy", videoFileName,
+            "-vn", "-c:a", "copy", audioFileName)
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true) // Merge error stream with output
+            .start()
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val output = reader.readLine() // Read first line of output
+        logger.info("Got $output from ffprobe")
+        process.waitFor()
+        return output
+    }
+
+    /**
+     * Splits a video file into chunks using mkvmerge
+     * @param videoFile The video file to split
+     * @param outputPrefix The prefix for output chunk files
+     * @param chunkSizeMB The maximum size of each chunk in MB
+     * @return List of chunk files
+     */
+    private fun splitVideoIntoChunks(videoFile: File, outputPrefix: String, chunkSizeMB: Int = this.chunkSizeMB): List<File> {
+        logger.info("Splitting video file ${videoFile.absolutePath} into chunks of ${chunkSizeMB}MB...")
+        
+        val command = listOf(
+            "mkvmerge",
+            "-o", outputPrefix,
+            "--split", "${chunkSizeMB}M",
+            videoFile.absolutePath
+        )
+        
+        logger.info("Executing command: ${command.joinToString(" ")}")
+        
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .start()
+        
+        // Read and log output
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                logger.info("mkvmerge: $line")
+            }
+        }
+        
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            logger.error("mkvmerge failed with exit code $exitCode")
+            throw RuntimeException("Failed to split video file using mkvmerge")
+        }
+        
+        // Find all chunk files
+        val outputDir = videoFile.parentFile
+        val chunkPrefix = File(outputPrefix).nameWithoutExtension
+        logger.info("Looking for chunk files with prefix: $chunkPrefix in directory: ${outputDir.absolutePath}")
+        val chunkFiles = outputDir.listFiles { _, name -> name.startsWith(chunkPrefix) }?.toList() ?: emptyList()
+        
+        logger.info("Created ${chunkFiles.size} chunk files")
+        chunkFiles.forEach { file -> logger.info("Chunk file: ${file.absolutePath}") }
+        
+        return chunkFiles.sortedBy { it.name }
+    }
+
+    private fun editMessageText(chatId: Long, messageId: Int, newText: String) {
+        val editMessage = EditMessageText.builder()
+            .chatId(chatId.toString())
+            .messageId(messageId)
+            .text(newText)
+            .parseMode("HTML")
+            .disableWebPagePreview(true)
+            .build()
+
+        try {
+            telegramClient.execute(editMessage)
+        } catch (e: TelegramApiException) {
+            // Handle error (message might not exist or bot doesn't have permission)
+            println("Failed to edit message: ${e.message}")
+        }
+    }
+}
+
+fun String.split2ByDash(reverseIfSingle: Boolean = false): Pair<String, String> {
+    val parts = this.split(" - ", limit = 2)
+    return when {
+        parts.size == 2 -> parts[0] to parts[1]
+        reverseIfSingle -> "" to parts[0]
+        else -> parts[0] to ""
+    }
+}
+
+fun String.removeFirstLine(): String {
+    return this.lineSequence().drop(1).joinToString("\n")
+}
+
+/**
+ * Validates if a video file is compatible with Telegram's requirements
+ * @param videoFile The video file to validate
+ * @return Pair of Boolean (isValid) and String (errorMessage)
+ */
+private fun validateVideoFile(videoFile: File): Pair<Boolean, String> {
+    if (!videoFile.exists() || !videoFile.isFile) {
+        return false to "File does not exist or is not a regular file"
+    }
+    
+    if (videoFile.length() == 0L) {
+        return false to "File is empty"
+    }
+    
+    // // Check file size (Telegram has a 2000MB limit for regular uploads)
+    // val fileSizeInBytes = videoFile.length()
+    // if (fileSizeInBytes > 2000 * 1024 * 1024) {
+    //     return false to "File size exceeds Telegram's 2000MB limit (${fileSizeInBytes / (1024.0 * 1024.0)} MB)"
+    // }
+    
+    // Check file extension
+    val fileName = videoFile.name.lowercase()
+    if (!fileName.endsWith(".mp4") && !fileName.endsWith(".mov") && !fileName.endsWith(".avi")) {
+        return false to "Unsupported file format: ${videoFile.extension}. Telegram supports MP4, MOV, and AVI"
+    }
+    
+    return true to "File is valid"
+}
+
+/**
+ * Validates if a thumbnail file is compatible with Telegram's requirements
+ * @param thumbnailFile The thumbnail file to validate
+ * @return Pair of Boolean (isValid) and String (errorMessage)
+ */
+private fun validateThumbnailFile(thumbnailFile: File?): Pair<Boolean, String> {
+    if (thumbnailFile == null) {
+        return true to "No thumbnail provided (optional)"
+    }
+    
+    if (!thumbnailFile.exists() || !thumbnailFile.isFile) {
+        return false to "Thumbnail file does not exist or is not a regular file"
+    }
+    
+    if (thumbnailFile.length() == 0L) {
+        return false to "Thumbnail file is empty"
+    }
+    
+    // Check thumbnail size (Telegram recommends thumbnails under 200KB)
+    val thumbnailSizeInBytes = thumbnailFile.length()
+    if (thumbnailSizeInBytes > 200 * 1024) {
+        return false to "Thumbnail size exceeds recommended 200KB limit (${thumbnailSizeInBytes / 1024.0} KB)"
+    }
+    
+    // Check thumbnail format
+    val fileName = thumbnailFile.name.lowercase()
+    if (!fileName.endsWith(".jpg") && !fileName.endsWith(".jpeg") && !fileName.endsWith(".png")) {
+        return false to "Unsupported thumbnail format: ${thumbnailFile.extension}. Telegram supports JPG and PNG"
+    }
+    
+    return true to "Thumbnail is valid"
 }
