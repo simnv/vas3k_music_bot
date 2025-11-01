@@ -197,7 +197,9 @@ class Bot(
                     "--playlist-items", "1",
                     "--write-thumbnail",
                     "--embed-thumbnail",
-                    "--convert-thumbnails", "jpg"
+                    "--convert-thumbnails", "jpg",
+                    "--js-runtimes", "deno:/usr/bin/deno",
+                    "--remote-components", "ejs:github"
                 ))
             }
             downloadedFile = download(
@@ -581,7 +583,13 @@ class Bot(
         logger.info("Running yt-dlp to get title and duration for $url...")
         val ipVersionParam = getIpVersionParam(url)
         val command = mutableListOf<String>().apply {
-            addAll(listOf("yt-dlp", "--cookies", "/cookies.txt", "--print", "%(title)s [%(duration)s]"))
+            addAll(listOf(
+                "yt-dlp",
+                "--cookies", "/cookies.txt",
+                "--print", "%(title)s [%(duration)s]",
+                "--js-runtimes", "deno:/usr/bin/deno",
+                "--remote-components", "ejs:github"
+            ))
             ipVersionParam?.let { add(it) }
             add(url)
         }
