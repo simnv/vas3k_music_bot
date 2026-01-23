@@ -183,6 +183,7 @@ class Bot(
         var downloadedFile: File? = null
         var thumbnailFile: File? = null
         var chunkFiles: List<File> = emptyList()
+        var telegramAudioFile: File? = null
         
         try {
             telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
@@ -192,7 +193,7 @@ class Bot(
                 ipVersionParam?.let { add(it) }
                 addAll(listOf(
                     "--cookies", "/cookies.txt",
-                    "-t", "mp4",
+                    "-f", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best", "--merge-output-format", "mp4",
                     "-I", "0",
                     "--playlist-items", "1",
                     "--write-thumbnail",
@@ -280,10 +281,21 @@ class Bot(
                 telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
                 
                 try {
-                    // For audio, we'll use the original file (first chunk)
-                    val audioFile = chunkFiles.first()
+                    // For audio, we'll use the original file (first chunk) but convert it to Telegram-compatible format
+                    val sourceAudioFile = chunkFiles.first()
+                    
+                    // Extract audio for Telegram
+                    editMessageText(chatId, intermediateMessageId, "$message\nExtracting audio...")
+                    try {
+                        telegramAudioFile = convertToTelegramAudio(sourceAudioFile)
+                    } catch (e: Exception) {
+                        logger.error("Failed to extract audio: ${e.message}", e)
+                        editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to extract audio: ${e.message}")
+                        return false
+                    }
+                    
                     val audioBuilder = SendAudio.builder()
-                        .audio(InputFile(audioFile))
+                        .audio(InputFile(telegramAudioFile))
                         .duration(videoDuration)
                         .caption(message.removeFirstLine())
                         .parseMode("HTML")
@@ -308,7 +320,7 @@ class Bot(
                 }
                 
                 editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-                val videoCheckFreezeDuration = 30.0 // videoDuration * 0.15
+                val videoCheckFreezeDuration = 15.0 // videoDuration * 0.15
                 val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
                 logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
                 sendVideo = (totalFreezeDuration / videoCheckFreezeDuration) < 0.5
@@ -410,6 +422,13 @@ class Bot(
                     if (file.exists()) {
                         file.delete()
                         logger.info("Deleted thumbnail file: ${file.absolutePath}")
+                    }
+                }
+                // Clean up converted Telegram audio file if it exists and wasn't already handled by delayedDelete
+                telegramAudioFile?.let { file ->
+                    if (file.exists()) {
+                        file.delete()
+                        logger.info("Deleted converted Telegram audio file: ${file.absolutePath}")
                     }
                 }
             } catch (e: Exception) {
@@ -768,6 +787,54 @@ class Bot(
         
         return chunkFiles.sortedBy { it.name }
     }
+    
+    /**
+     * Extracts audio from a file for Telegram using ffmpeg
+     * @param inputFile The input video/audio file
+     * @return The extracted audio file
+     */
+    private fun convertToTelegramAudio(inputFile: File): File {
+        logger.info("Extracting audio from ${inputFile.absolutePath} for Telegram...")
+        
+        // Create output file with .m4a extension in the same directory (Telegram supports m4a)
+        val outputFile = File(inputFile.parentFile, "${UUID.randomUUID()}_telegram_audio.m4a")
+        
+        // Simple command to extract audio without conversion
+        val command = listOf(
+            "ffmpeg",
+            "-i", inputFile.absolutePath,
+            "-vn",                   // Extract audio only
+            "-acodec", "copy",      // Copy audio without re-encoding
+            outputFile.absolutePath
+        )
+        
+        logger.info("Executing ffmpeg command: ${command.joinToString(" ")}")
+        
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .start()
+        
+        // Read and log output
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                logger.info("ffmpeg: $line")
+            }
+        }
+        
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            logger.error("ffmpeg failed with exit code $exitCode")
+            throw RuntimeException("Failed to extract audio using ffmpeg")
+        }
+        
+        logger.info("Successfully extracted audio to ${outputFile.absolutePath}")
+        
+        // Register the file for delayed deletion
+        delayedDelete(outputFile)
+        
+        return outputFile
+    }
+    
 
     private fun editMessageText(chatId: Long, messageId: Int, newText: String) {
         val editMessage = EditMessageText.builder()
