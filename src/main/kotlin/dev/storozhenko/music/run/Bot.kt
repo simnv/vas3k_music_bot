@@ -38,7 +38,9 @@ class Bot(
     private val telegramAllowList: String,
     private val errorNotificationTelegramId: String?,
     private val ipv6UrlContains: String?,
-    private val chunkSizeMB: Int
+    private val chunkSizeMB: Int,
+    private val ytdlProxy: String?,
+    private val ytdlProxyUrlContains: String?
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
     private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
@@ -60,12 +62,24 @@ class Bot(
         if (ipv6UrlContains.isNullOrEmpty()) {
             return null
         }
-        
+
         val urlContainsList = ipv6UrlContains.split(",").map { it.trim() }
         return if (urlContainsList.any { url.contains(it, ignoreCase = true) }) {
             "-6"
         } else {
             "-4"
+        }
+    }
+
+    private fun getProxyParams(url: String): List<String> {
+        if (ytdlProxy.isNullOrEmpty() || ytdlProxyUrlContains.isNullOrEmpty()) {
+            return emptyList()
+        }
+        val urlContainsList = ytdlProxyUrlContains.split(",").map { it.trim() }
+        return if (urlContainsList.any { url.contains(it, ignoreCase = true) }) {
+            listOf("--proxy", ytdlProxy)
+        } else {
+            emptyList()
         }
     }
 
@@ -191,6 +205,7 @@ class Bot(
             val ipVersionParam = getIpVersionParam(url)
             val downloadParams = mutableListOf<String>().apply {
                 ipVersionParam?.let { add(it) }
+                addAll(getProxyParams(url))
                 addAll(listOf(
                     "--cookies", "/cookies.txt",
                     "-f", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best", "--merge-output-format", "mp4",
@@ -610,6 +625,7 @@ class Bot(
                 "--remote-components", "ejs:github"
             ))
             ipVersionParam?.let { add(it) }
+            addAll(getProxyParams(url))
             add(url)
         }
         logger.info(command.joinToString(" "))

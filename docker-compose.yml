@@ -25,6 +25,8 @@ services:
       - TELEGRAM_BASE_PORT
       - YTDL_LOCATION
       - ERROR_NOTIFICATION_TELEGRAM_ID
+      - YTDL_PROXY
+      - YTDL_PROXY_URL_CONTAINS
     depends_on:
       - tgbot-api
     networks:

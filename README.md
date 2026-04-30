@@ -229,6 +229,8 @@ make redeploy-prod
 | `TELEGRAM_ALLOW_LIST` | Yes | - | Allow list of chat ids and their names |
 | `ERROR_NOTIFICATION_TELEGRAM_ID` | No | - | User ID for error notifications |
 | `IPV6_URL_CONTAINS` | No | - | Comma-separated domains for IPv6 |
+| `YTDL_PROXY` | No | - | yt-dlp SOCKS/HTTP proxy URL, e.g. `socks5://our-proxy:1080`. Used together with `YTDL_PROXY_URL_CONTAINS`. |
+| `YTDL_PROXY_URL_CONTAINS` | No | - | Comma-separated URL substrings; matching URLs are downloaded via `YTDL_PROXY`. Both vars must be set to activate. |
 | `CHUNK_SIZE_MB` | No | 50 | Video chunk size in MB for splitting large files |
 | `YTDL_LOCATION` | No | `/usr/local/bin/yt-dlp` | yt-dlp binary location |
 | `TELEGRAM_API_ID` | Yes | - | API ID from my.telegram.org |
