@@ -86,10 +86,10 @@ class Bot(
         }
     }
 
-    private enum class Quality(val formatSelector: String) {
-        LOW("bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[ext=mp4]/best"),
-        MEDIUM("bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best"),
-        HIGH("bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+    private enum class Quality(val label: String, val formatSelector: String) {
+        LOW("≤480p", "bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[ext=mp4]/best"),
+        MEDIUM("≤720p", "bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best"),
+        HIGH("best", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best")
     }
 
     private fun parseQuality(text: String): Quality {
@@ -178,22 +178,23 @@ class Bot(
         }
 
         var initialMessage = update.message.text
-        val links = entities
-            .filter { entity -> entity.type == "url" }
-            .mapNotNull(odesilService::detect)
-            .mapIndexed { index, odesilEntity ->
-                mapOdesilResponse(odesilEntity.odesilResponse)
-            }
-        val validLinks = entities
-            .filter { entity -> entity.type == "url" && isValidDownloadUrl(entity.text) }
+        val urlEntities = entities.filter { entity -> entity.type == "url" }
+        if (urlEntities.isEmpty()) {
+            logger.info("No URL entities, returning")
+            return
+        }
+
+        val pulser = ChatActionPulser(chatId, "typing")
+        try {
+        val odesilDetections = urlEntities.mapNotNull(odesilService::detect)
+        val links = odesilDetections.map { mapOdesilResponse(it.odesilResponse) }
+        val validLinks = urlEntities.filter { entity -> isValidDownloadUrl(entity.text) }
 
         if (links.isEmpty() && validLinks.isEmpty()) {
             logger.info("No links from Odesil or valid video services, returning")
             return
         }
 
-        val pulser = ChatActionPulser(chatId, "typing")
-        try {
         val from = update.message.from.userName
         val fromId = update.message.from.id
         lateinit var linksMessage: String
@@ -207,6 +208,21 @@ class Bot(
             val validLink = validLinks.first()
             val videoTitle = getVideoTitle(validLink.text)
             linksMessage = "$videoTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+        }
+
+        val youtubeFromMessage = extractFirstUrlByText(linksMessage, "Youtube")
+        val ytSearchUrl: String? = if (youtubeFromMessage == null && odesilDetections.isNotEmpty()) {
+            val firstDetection = odesilDetections.first().odesilResponse
+            val data = firstDetection.entitiesByUniqueId[firstDetection.entityUniqueId]
+            val query = listOfNotNull(data?.artistName, data?.title)
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
+            if (query.isNotBlank()) ytSearchFirst(query) else null
+        } else null
+        if (ytSearchUrl != null) {
+            val ytLink = "<a href=\"$ytSearchUrl\">YouTube search</a>"
+            val parts = linksMessage.split("\n", limit = 2)
+            linksMessage = if (parts.size == 2) "${parts[0]}\n$ytLink | ${parts[1]}" else "$linksMessage\n$ytLink"
         }
 
         val message = "$linksMessage"
@@ -223,7 +239,7 @@ class Bot(
         val tmId = textMessage.messageId
 
         val quality = parseQuality(update.message.text)
-        val yturl = extractFirstUrlByText(message, "Youtube")
+        val yturl = youtubeFromMessage ?: ytSearchUrl
         val success = if (yturl != null) {
             downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId, quality, pulser)
         } else if (!validLinks.isEmpty()) {
@@ -254,7 +270,7 @@ class Bot(
 
         try {
             pulser.set("typing")
-            editMessageText(chatId, intermediateMessageId, "$message\nDownloading (${quality.name.lowercase()})...")
+            editMessageText(chatId, intermediateMessageId, "$message\nDownloading (${quality.label} — use low/medium/high after link to change)...")
             val ipVersionParam = getIpVersionParam(url)
             val downloadParams = mutableListOf<String>().apply {
                 ipVersionParam?.let { add(it) }
@@ -392,16 +408,26 @@ class Bot(
                 
                 pulser.set("typing")
                 editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-                val analysisStart = videoDuration * 0.2
-                val analysisDuration = 15.0
-                val sceneChangeCount = getSceneChangeCount(downloadedFile, analysisStart, analysisDuration)
-                sendVideo = if (sceneChangeCount >= 2) {
-                    logger.info("${downloadedFile.absolutePath} sceneChangeCount=$sceneChangeCount >= 2, treating as moving")
+                val windows: List<Pair<Double, Double>> = when {
+                    videoDuration <= 30 -> listOf(0.0 to videoDuration.toDouble())
+                    videoDuration > 60 -> {
+                        val start = 30.0
+                        val span = videoDuration - 30.0
+                        listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (start + span * it) to 5.0 }
+                    }
+                    else -> listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (videoDuration * it) to 5.0 }
+                }
+                logger.info("${downloadedFile.absolutePath} duration=${videoDuration}s, analysis windows=$windows")
+                val totalSceneCount = windows.sumOf { (s, d) -> getSceneChangeCount(downloadedFile, s, d) }
+                sendVideo = if (totalSceneCount >= 2) {
+                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount >= 2, treating as moving")
                     true
                 } else {
-                    val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, analysisStart, analysisDuration)
-                    logger.info("${downloadedFile.absolutePath} sceneChangeCount=$sceneChangeCount, totalFreezeDuration / analysisDuration = ${totalFreezeDuration} / ${analysisDuration} = ${totalFreezeDuration / analysisDuration}")
-                    (totalFreezeDuration / analysisDuration) < 0.5
+                    val totalFreezeDuration = windows.sumOf { (s, d) -> getTotalFreezeDuration(downloadedFile, s, d) }
+                    val totalAnalyzed = windows.sumOf { (_, d) -> d }
+                    val ratio = totalFreezeDuration / totalAnalyzed
+                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount, totalFreezeDuration / totalAnalyzed = $totalFreezeDuration / $totalAnalyzed = $ratio")
+                    ratio < 0.5
                 }
             }
 
@@ -644,10 +670,10 @@ class Bot(
         val command = listOf(
             "ffmpeg",
             "-v", "error",
+            "-ss", startTime.toString(),
+            "-t", duration.toString(),
             "-i", videoFile.absolutePath,
-            "-ss", startTime.toInt().toString(),
-            "-t", duration.toInt().toString(),
-            "-vf", "freezedetect=n=-60dB:d=1,metadata=mode=print:file=-",
+            "-vf", "freezedetect=n=-30dB:d=1,metadata=mode=print:file=-",
             "-map", "0:v:0",
             "-f", "null",
             "-"
@@ -659,20 +685,29 @@ class Bot(
             .start()
 
         var totalFreezeDuration = 0.0
+        var openFreezeStart: Double? = null
+        val freezeStartPattern = Regex("lavfi\\.freezedetect\\.freeze_start=(\\d+\\.?\\d*)")
         val freezeDurationPattern = Regex("lavfi\\.freezedetect\\.freeze_duration=(\\d+\\.?\\d*)")
+        val freezeEndPattern = Regex("lavfi\\.freezedetect\\.freeze_end=(\\d+\\.?\\d*)")
 
         BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
             reader.lineSequence().forEach { line ->
                 logger.info(line)
-                
-                // Check for freeze duration and add to total
-                freezeDurationPattern.find(line)?.let { match ->
-                    totalFreezeDuration += match.groupValues[1].toDouble()
+                freezeStartPattern.find(line)?.let { openFreezeStart = it.groupValues[1].toDouble() }
+                freezeDurationPattern.find(line)?.let {
+                    totalFreezeDuration += it.groupValues[1].toDouble()
                 }
+                freezeEndPattern.find(line)?.let { openFreezeStart = null }
             }
         }
 
         process.waitFor()
+        // If a freeze started but never ended within the clip, count from start to clip end.
+        openFreezeStart?.let { start ->
+            val ongoing = (duration - start).coerceAtLeast(0.0)
+            totalFreezeDuration += ongoing
+            logger.info("Open freeze from $start to clip end (+$ongoing)")
+        }
         logger.info("Total Freeze Duration: $totalFreezeDuration")
         return totalFreezeDuration
     }
@@ -682,10 +717,10 @@ class Bot(
         val command = listOf(
             "ffmpeg",
             "-v", "error",
+            "-ss", startTime.toString(),
+            "-t", duration.toString(),
             "-i", videoFile.absolutePath,
-            "-ss", startTime.toInt().toString(),
-            "-t", duration.toInt().toString(),
-            "-vf", "select='gt(scene,0.1)',metadata=print:file=-",
+            "-vf", "select='gt(scene,0.05)',metadata=print:file=-",
             "-map", "0:v:0",
             "-an",
             "-f", "null",
@@ -710,6 +745,33 @@ class Bot(
         process.waitFor()
         logger.info("Scene change count: $sceneCount")
         return sceneCount
+    }
+
+    private fun ytSearchFirst(query: String): String? {
+        logger.info("Running yt-dlp ytsearch for: $query")
+        val command = listOf(
+            "yt-dlp",
+            "--cookies", "/cookies.txt",
+            "--print", "%(webpage_url)s",
+            "--skip-download",
+            "--js-runtimes", "deno:/usr/bin/deno",
+            "--remote-components", "ejs:github",
+            "--retries", "5",
+            "--fragment-retries", "5",
+            "--socket-timeout", "30",
+            "ytsearch1:$query"
+        )
+        logger.info(command.joinToString(" "))
+        return try {
+            val process = ProcessBuilder(command).redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().readText().trim()
+            process.waitFor()
+            logger.info("ytsearch output: $output")
+            output.lineSequence().firstOrNull { it.startsWith("http") }
+        } catch (e: Exception) {
+            logger.error("ytsearch failed for $query", e)
+            null
+        }
     }
 
     private fun getVideoTitle(url: String): String {

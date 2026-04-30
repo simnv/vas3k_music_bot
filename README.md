@@ -9,7 +9,8 @@ Based on the original project by [AngryJKirk](https://github.com/AngryJKirk/vas3
 - **Multi-platform music link parsing** via Odesli API (Spotify, YouTube, Apple Music, etc.)
 - **Video/Audio downloading** from YouTube, TikTok, VK, RuTube
 - **Smart content detection** - automatically sends audio for music-focused chats
-- **Freeze detection** - analyzes video content to determine should we send video
+- **Scene/freeze analysis** - decides whether to send video by counting scene changes, falling back to freeze detection
+- **Quality selector** - choose download quality via keyword in the message (`low`/`medium`/`high`); defaults to medium (≤720p)
 - **Video chunking** - automatically splits large videos into smaller chunks for Telegram
 - **Allow list system** - restricts bot usage to authorized chats
 - **Error notifications** - sends error reports to configured Telegram ID
@@ -298,6 +299,16 @@ mvn package -DskipTests
 ## Bot Commands
 
 - `/help` - Show help message
+
+## Usage
+
+Send a supported link in an authorized chat. Optionally add a quality keyword anywhere in the message:
+
+- `low` / `l` — up to 480p
+- `medium` / `med` / `mid` / `m` — up to 720p (default)
+- `high` / `hi` / `h` — best available
+
+Single-letter aliases (`l`/`m`/`h`) are only recognized at the start or end of the message.
 
 ## Supported Platforms
 
