@@ -7,9 +7,12 @@ import dev.storozhenko.music.services.OdesilService
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import java.io.Closeable
 import kotlin.time.Duration.Companion.minutes
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
@@ -83,6 +86,51 @@ class Bot(
         }
     }
 
+    private enum class Quality(val formatSelector: String) {
+        LOW("bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[ext=mp4]/best"),
+        MEDIUM("bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best"),
+        HIGH("bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+    }
+
+    private fun parseQuality(text: String): Quality {
+        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return Quality.MEDIUM
+        val lastIdx = tokens.size - 1
+        return tokens.withIndex().firstNotNullOfOrNull { (i, raw) ->
+            val tok = raw.lowercase()
+            val atBoundary = i == 0 || i == lastIdx
+            when {
+                tok == "low" -> Quality.LOW
+                tok == "medium" || tok == "med" || tok == "mid" -> Quality.MEDIUM
+                tok == "high" || tok == "hi" -> Quality.HIGH
+                atBoundary && tok == "l" -> Quality.LOW
+                atBoundary && tok == "m" -> Quality.MEDIUM
+                atBoundary && tok == "h" -> Quality.HIGH
+                else -> null
+            }
+        } ?: Quality.MEDIUM
+    }
+
+    private inner class ChatActionPulser(private val chatId: Long, initialAction: String) : Closeable {
+        @Volatile private var action: String = initialAction
+        private val job: Job = coroutine.launch {
+            while (isActive) {
+                try {
+                    telegramClient.execute(SendChatAction(chatId.toString(), action))
+                } catch (e: Exception) {
+                    logger.info("Failed to send chat action: ${e.message}")
+                }
+                delay(5_000)
+            }
+        }
+        fun set(newAction: String) {
+            action = newAction
+        }
+        override fun close() {
+            job.cancel()
+        }
+    }
+
     override fun consume(updates: MutableList<Update>) {
         logger.info("Got ${updates.size} updates")
         updates.forEach {
@@ -129,7 +177,6 @@ class Bot(
             return
         }
 
-        telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
         var initialMessage = update.message.text
         val links = entities
             .filter { entity -> entity.type == "url" }
@@ -145,6 +192,8 @@ class Bot(
             return
         }
 
+        val pulser = ChatActionPulser(chatId, "typing")
+        try {
         val from = update.message.from.userName
         val fromId = update.message.from.id
         lateinit var linksMessage: String
@@ -173,12 +222,13 @@ class Bot(
         val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview(); disableNotification() })
         val tmId = textMessage.messageId
 
+        val quality = parseQuality(update.message.text)
         val yturl = extractFirstUrlByText(message, "Youtube")
         val success = if (yturl != null) {
-            downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId)
+            downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId, quality, pulser)
         } else if (!validLinks.isEmpty()) {
             val validurl = validLinks.first().text
-            downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId)
+            downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId, quality, pulser)
         } else {
             // No video to download, but we have Odesli information
             // Keep the text message with Odesli information
@@ -191,31 +241,37 @@ class Bot(
         } else {
             logger.info("Not deleting intermediate text message $tmId - keeping Odesli information")
         }
+        } finally {
+            pulser.close()
+        }
     }
 
-    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long): Boolean {
+    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, pulser: ChatActionPulser): Boolean {
         var downloadedFile: File? = null
         var thumbnailFile: File? = null
         var chunkFiles: List<File> = emptyList()
         var telegramAudioFile: File? = null
-        
+
         try {
-            telegramClient.execute(SendChatAction(chatId.toString(), "typing"))
-            editMessageText(chatId, intermediateMessageId, "$message\nDownloading...")
+            pulser.set("typing")
+            editMessageText(chatId, intermediateMessageId, "$message\nDownloading (${quality.name.lowercase()})...")
             val ipVersionParam = getIpVersionParam(url)
             val downloadParams = mutableListOf<String>().apply {
                 ipVersionParam?.let { add(it) }
                 addAll(getProxyParams(url))
                 addAll(listOf(
                     "--cookies", "/cookies.txt",
-                    "-f", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best", "--merge-output-format", "mp4",
+                    "-f", quality.formatSelector, "--merge-output-format", "mp4",
                     "-I", "0",
                     "--playlist-items", "1",
                     "--write-thumbnail",
                     "--embed-thumbnail",
                     "--convert-thumbnails", "jpg",
                     "--js-runtimes", "deno:/usr/bin/deno",
-                    "--remote-components", "ejs:github"
+                    "--remote-components", "ejs:github",
+                    "--retries", "5",
+                    "--fragment-retries", "5",
+                    "--socket-timeout", "30"
                 ))
             }
             downloadedFile = download(
@@ -293,7 +349,7 @@ class Bot(
             if (idHasMusic) {
                 logger.info("Sending Audio...")
                 editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
-                telegramClient.execute(SendChatAction(chatId.toString(), "upload_voice"))
+                pulser.set("upload_voice")
                 
                 try {
                     // For audio, we'll use the original file (first chunk) but convert it to Telegram-compatible format
@@ -334,11 +390,19 @@ class Bot(
                     return false
                 }
                 
+                pulser.set("typing")
                 editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-                val videoCheckFreezeDuration = 15.0 // videoDuration * 0.15
-                val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, videoDuration * 0.2, videoCheckFreezeDuration)
-                logger.info("${downloadedFile.absolutePath} totalFreezeDuration / videoCheckFreezeDuration = ${totalFreezeDuration} / ${videoCheckFreezeDuration} = ${totalFreezeDuration / videoCheckFreezeDuration}")
-                sendVideo = (totalFreezeDuration / videoCheckFreezeDuration) < 0.5
+                val analysisStart = videoDuration * 0.2
+                val analysisDuration = 15.0
+                val sceneChangeCount = getSceneChangeCount(downloadedFile, analysisStart, analysisDuration)
+                sendVideo = if (sceneChangeCount >= 2) {
+                    logger.info("${downloadedFile.absolutePath} sceneChangeCount=$sceneChangeCount >= 2, treating as moving")
+                    true
+                } else {
+                    val totalFreezeDuration = getTotalFreezeDuration(downloadedFile, analysisStart, analysisDuration)
+                    logger.info("${downloadedFile.absolutePath} sceneChangeCount=$sceneChangeCount, totalFreezeDuration / analysisDuration = ${totalFreezeDuration} / ${analysisDuration} = ${totalFreezeDuration / analysisDuration}")
+                    (totalFreezeDuration / analysisDuration) < 0.5
+                }
             }
 
             // Send video chunks
@@ -356,7 +420,7 @@ class Bot(
                     
                     editMessageText(chatId, intermediateMessageId, statusMessage)
                     logger.info("Sending Video chunk $chunkNumber of $totalChunks...")
-                    telegramClient.execute(SendChatAction(chatId.toString(), "upload_video"))
+                    pulser.set("upload_video")
                     
                     try {
                         // Get dimensions for this chunk
@@ -613,6 +677,41 @@ class Bot(
         return totalFreezeDuration
     }
 
+    private fun getSceneChangeCount(videoFile: File, startTime: Double, duration: Double): Int {
+        logger.info("Running ffmpeg for $videoFile to count scene changes...")
+        val command = listOf(
+            "ffmpeg",
+            "-v", "error",
+            "-i", videoFile.absolutePath,
+            "-ss", startTime.toInt().toString(),
+            "-t", duration.toInt().toString(),
+            "-vf", "select='gt(scene,0.1)',metadata=print:file=-",
+            "-map", "0:v:0",
+            "-an",
+            "-f", "null",
+            "-"
+        )
+        logger.info(command.joinToString(" "))
+
+        val process = ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .start()
+
+        var sceneCount = 0
+        val sceneScorePattern = Regex("lavfi\\.scene_score=")
+
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                logger.info(line)
+                if (sceneScorePattern.containsMatchIn(line)) sceneCount++
+            }
+        }
+
+        process.waitFor()
+        logger.info("Scene change count: $sceneCount")
+        return sceneCount
+    }
+
     private fun getVideoTitle(url: String): String {
         logger.info("Running yt-dlp to get title and duration for $url...")
         val ipVersionParam = getIpVersionParam(url)
@@ -622,7 +721,10 @@ class Bot(
                 "--cookies", "/cookies.txt",
                 "--print", "%(title)s [%(duration)s]",
                 "--js-runtimes", "deno:/usr/bin/deno",
-                "--remote-components", "ejs:github"
+                "--remote-components", "ejs:github",
+                "--retries", "5",
+                "--fragment-retries", "5",
+                "--socket-timeout", "30"
             ))
             ipVersionParam?.let { add(it) }
             addAll(getProxyParams(url))
