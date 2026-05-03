@@ -662,9 +662,10 @@ class Bot(
         logger.info("Running yt-dlp for $url...")
         val folderName = UUID.randomUUID().toString()
         val folder = File("/tmp", folderName).apply { mkdir() }
-        logger.info(params.joinToString(" "))
+        val command = listOf(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename") + params.toList()
+        logger.info(command.shellJoin())
         val process =
-            ProcessBuilder(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename", *params)
+            ProcessBuilder(command)
                 .redirectErrorStream(true)
                 .start()
         BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
@@ -727,7 +728,7 @@ class Bot(
             "-f", "null",
             "-"
         )
-        logger.info(command.joinToString(" "))
+        logger.info(command.shellJoin())
 
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
@@ -741,7 +742,6 @@ class Bot(
 
         BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
             reader.lineSequence().forEach { line ->
-                logger.info(line)
                 freezeStartPattern.find(line)?.let { openFreezeStart = it.groupValues[1].toDouble() }
                 freezeDurationPattern.find(line)?.let {
                     totalFreezeDuration += it.groupValues[1].toDouble()
@@ -775,7 +775,7 @@ class Bot(
             "-f", "null",
             "-"
         )
-        logger.info(command.joinToString(" "))
+        logger.info(command.shellJoin())
 
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
@@ -786,7 +786,6 @@ class Bot(
 
         BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
             reader.lineSequence().forEach { line ->
-                logger.info(line)
                 if (sceneScorePattern.containsMatchIn(line)) sceneCount++
             }
         }
@@ -810,7 +809,7 @@ class Bot(
             "--socket-timeout", "30",
             "ytsearch1:$query"
         )
-        logger.info(command.joinToString(" "))
+        logger.info(command.shellJoin())
         try {
             val process = ProcessBuilder(command).redirectErrorStream(true).start()
             val output = process.inputStream.bufferedReader().readText().trim()
@@ -841,7 +840,7 @@ class Bot(
             addAll(getProxyParams(url))
             add(url)
         }
-        logger.info(command.joinToString(" "))
+        logger.info(command.shellJoin())
 
         val process = ProcessBuilder(command)
             .redirectErrorStream(true) // Merge error stream with output
@@ -962,21 +961,22 @@ class Bot(
         
         val command = listOf(
             "mkvmerge",
+            "--quiet",
             "-o", outputPrefix,
             "--split", "${chunkSizeMB}M",
             videoFile.absolutePath
         )
-        
-        logger.info("Executing command: ${command.joinToString(" ")}")
-        
+
+        logger.info("Executing command: ${command.shellJoin()}")
+
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
             .start()
-        
-        // Read and log output
+
+        // --quiet suppresses progress/info; anything left is a warning or error.
         BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
             reader.lineSequence().forEach { line ->
-                logger.info("mkvmerge: $line")
+                if (line.isNotBlank()) logger.warn("mkvmerge: $line")
             }
         }
         
@@ -1012,22 +1012,23 @@ class Bot(
         // Simple command to extract audio without conversion
         val command = listOf(
             "ffmpeg",
+            "-hide_banner", "-nostats", "-loglevel", "error",
             "-i", inputFile.absolutePath,
             "-vn",                   // Extract audio only
             "-acodec", "copy",      // Copy audio without re-encoding
             outputFile.absolutePath
         )
-        
-        logger.info("Executing ffmpeg command: ${command.joinToString(" ")}")
-        
+
+        logger.info("Executing ffmpeg command: ${command.shellJoin()}")
+
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
             .start()
-        
-        // Read and log output
+
+        // Read and log output (only surfaces real errors thanks to -loglevel error)
         BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
             reader.lineSequence().forEach { line ->
-                logger.info("ffmpeg: $line")
+                if (line.isNotBlank()) logger.warn("ffmpeg: $line")
             }
         }
         
@@ -1063,6 +1064,14 @@ class Bot(
         }
     }
 }
+
+private fun String.shellQuote(): String {
+    if (this.isEmpty()) return "''"
+    if (this.all { it.isLetterOrDigit() || it in "_./@:=+-,%" }) return this
+    return "'" + this.replace("'", "'\\''") + "'"
+}
+
+private fun List<String>.shellJoin(): String = joinToString(" ") { it.shellQuote() }
 
 fun String.split2ByDash(reverseIfSingle: Boolean = false): Pair<String, String> {
     val parts = this.split(" - ", limit = 2)

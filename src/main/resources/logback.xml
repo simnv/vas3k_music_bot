@@ -1,4 +1,4 @@
-<configuration scan="true" scanPeriod="30 seconds">
+<configuration>
     <property name="LOGGING_LEVEL" value="${logging.level:-INFO}"/>
     <property name="STDOUT_APPENDER_NAME" value="${logging.stdoutAppenderName:-application-stdout}"/>
 
