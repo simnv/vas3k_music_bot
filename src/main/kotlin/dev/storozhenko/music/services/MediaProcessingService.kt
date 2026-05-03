@@ -1,0 +1,88 @@
+package dev.storozhenko.music.services
+
+import dev.storozhenko.music.delayedDelete
+import dev.storozhenko.music.getLogger
+import dev.storozhenko.music.shellJoin
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.runInterruptible
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
+import java.util.UUID
+
+class MediaProcessingService(
+    private val virtualDispatcher: CoroutineDispatcher,
+    private val fileDeleteScope: CoroutineScope,
+    private val defaultChunkSizeMB: Int,
+    private val errorNotificationService: ErrorNotificationService? = null
+) {
+    private val logger = getLogger()
+
+    suspend fun splitVideoIntoChunks(
+        videoFile: File,
+        outputPrefix: String,
+        chunkSizeMB: Int = defaultChunkSizeMB
+    ): List<File> = runInterruptible(virtualDispatcher) {
+        logger.info("Splitting video file ${videoFile.absolutePath} into chunks of ${chunkSizeMB}MB...")
+        val command = listOf(
+            "mkvmerge", "--quiet",
+            "-o", outputPrefix,
+            "--split", "${chunkSizeMB}M",
+            videoFile.absolutePath
+        )
+        logger.info("Executing command: ${command.shellJoin()}")
+        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                if (line.isNotBlank()) logger.warn("mkvmerge: $line")
+            }
+        }
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            logger.error("mkvmerge failed with exit code $exitCode")
+            throw RuntimeException("Failed to split video file using mkvmerge")
+        }
+        val outputDir = videoFile.parentFile
+        val chunkPrefix = File(outputPrefix).nameWithoutExtension
+        logger.info("Looking for chunk files with prefix: $chunkPrefix in directory: ${outputDir.absolutePath}")
+        val chunkFiles = outputDir.listFiles { _, name -> name.startsWith(chunkPrefix) }?.toList() ?: emptyList()
+        logger.info("Created ${chunkFiles.size} chunk files")
+        chunkFiles.forEach { logger.info("Chunk file: ${it.absolutePath}") }
+        chunkFiles.sortedBy { it.name }
+    }
+
+    suspend fun convertToTelegramAudio(inputFile: File): File = runInterruptible(virtualDispatcher) {
+        logger.info("Extracting audio from ${inputFile.absolutePath} for Telegram...")
+        val outputFile = File(inputFile.parentFile, "${UUID.randomUUID()}_telegram_audio.m4a")
+        val command = listOf(
+            "ffmpeg",
+            "-hide_banner", "-nostats", "-loglevel", "error",
+            "-i", inputFile.absolutePath,
+            "-vn",
+            "-acodec", "copy",
+            outputFile.absolutePath
+        )
+        logger.info("Executing ffmpeg command: ${command.shellJoin()}")
+        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                if (line.isNotBlank()) logger.warn("ffmpeg: $line")
+            }
+        }
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            logger.error("ffmpeg failed with exit code $exitCode")
+            throw RuntimeException("Failed to extract audio using ffmpeg")
+        }
+        logger.info("Successfully extracted audio to ${outputFile.absolutePath}")
+        scheduleDelete(outputFile)
+        outputFile
+    }
+
+    private fun scheduleDelete(file: File) {
+        fileDeleteScope.delayedDelete(file, logger) { e ->
+            errorNotificationService?.sendErrorNotification(e, "File Deletion: ${file.absolutePath}")
+        }
+    }
+}

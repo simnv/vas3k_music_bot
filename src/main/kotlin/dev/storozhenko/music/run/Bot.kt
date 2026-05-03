@@ -3,33 +3,27 @@ package dev.storozhenko.music.run
 import dev.storozhenko.music.OdesilResponse
 import dev.storozhenko.music.Quality
 import dev.storozhenko.music.RequestOptions
-import dev.storozhenko.music.changeExtension
-import dev.storozhenko.music.delayedDelete
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.parseRequestOptions
 import dev.storozhenko.music.removeFirstLine
 import dev.storozhenko.music.services.DownloadService
 import dev.storozhenko.music.services.ErrorNotificationService
+import dev.storozhenko.music.services.MediaProbeService
+import dev.storozhenko.music.services.MediaProcessingService
 import dev.storozhenko.music.services.OdesilService
 import dev.storozhenko.music.services.UrlValidator
-import dev.storozhenko.music.shellJoin
 import dev.storozhenko.music.split2ByDash
-import dev.storozhenko.music.validateThumbnailFile
 import dev.storozhenko.music.validateVideoFile
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runInterruptible
 import java.io.Closeable
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
@@ -49,8 +43,6 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.Executors
 import org.jsoup.Jsoup
-import java.io.BufferedReader
-import java.io.InputStreamReader
 
 class Bot(
     private val botName: String,
@@ -68,6 +60,8 @@ class Bot(
     private val odesilService = OdesilService()
     private val urlValidator = UrlValidator()
     private val downloader: DownloadService
+    private val probe: MediaProbeService
+    private val processor: MediaProcessingService
     val handler = CoroutineExceptionHandler { _, exception ->
         logger.error("Caught exception: $exception")
         errorNotificationService?.sendErrorNotification(exception)
@@ -88,6 +82,8 @@ class Bot(
             ipv6UrlContains, ytdlProxy, ytdlProxyUrlContains,
             errorNotificationService
         )
+        probe = MediaProbeService(virtualDispatcher)
+        processor = MediaProcessingService(virtualDispatcher, fileDeleteScope, chunkSizeMB, errorNotificationService)
     }
 
 
@@ -286,7 +282,7 @@ class Bot(
                 }
 
             thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
-            val duration = getMediaDuration(downloadedFile)
+            val duration = probe.getMediaDuration(downloadedFile)
 
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
             editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
@@ -356,7 +352,7 @@ class Bot(
             thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
             
             editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
-            val dimensions = getVideoDimensions(downloadedFile)
+            val dimensions = probe.getVideoDimensions(downloadedFile)
             logger.info("Video dimensions: $dimensions")
             
             val (videoWidth, videoHeight, videoDuration) = try {
@@ -375,7 +371,7 @@ class Bot(
             if (fileSizeInMB > chunkSizeMB) {
                 editMessageText(chatId, intermediateMessageId, "$message\nSplitting video into chunks...")
                 val outputPrefix = "${downloadedFile.parentFile.absolutePath}/${downloadedFile.nameWithoutExtension}_chunk.mp4"
-                chunkFiles = splitVideoIntoChunks(downloadedFile, outputPrefix)
+                chunkFiles = processor.splitVideoIntoChunks(downloadedFile, outputPrefix)
                 
                 if (chunkFiles.isEmpty()) {
                     logger.error("No chunk files were created")
@@ -393,31 +389,7 @@ class Bot(
             if (idHasMusic) {
                 pulser.set("typing")
                 editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-                val windows: List<Pair<Double, Double>> = when {
-                    videoDuration <= 30 -> listOf(0.0 to videoDuration.toDouble())
-                    videoDuration > 60 -> {
-                        val start = 30.0
-                        val span = videoDuration - 30.0
-                        listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (start + span * it) to 5.0 }
-                    }
-                    else -> listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (videoDuration * it) to 5.0 }
-                }
-                logger.info("${downloadedFile.absolutePath} duration=${videoDuration}s, analysis windows=$windows")
-                val downloadedFileLocal = downloadedFile
-                val (totalSceneCount, totalFreezeDuration) = coroutineScope {
-                    val sceneJobs = windows.map { (s, d) -> async { getSceneChangeCount(downloadedFileLocal, s, d) } }
-                    val freezeJobs = windows.map { (s, d) -> async { getTotalFreezeDuration(downloadedFileLocal, s, d) } }
-                    sceneJobs.awaitAll().sum() to freezeJobs.awaitAll().sum()
-                }
-                sendVideo = if (totalSceneCount >= 2) {
-                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount >= 2, treating as moving")
-                    true
-                } else {
-                    val totalAnalyzed = windows.sumOf { (_, d) -> d }
-                    val ratio = totalFreezeDuration / totalAnalyzed
-                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount, totalFreezeDuration / totalAnalyzed = $totalFreezeDuration / $totalAnalyzed = $ratio")
-                    ratio < 0.5
-                }
+                sendVideo = probe.decideSendAsVideo(downloadedFile, videoDuration)
             }
 
             // Send audio if decision was audio (not video)
@@ -433,7 +405,7 @@ class Bot(
                     // Extract audio for Telegram
                     editMessageText(chatId, intermediateMessageId, "$message\nExtracting audio...")
                     try {
-                        telegramAudioFile = convertToTelegramAudio(sourceAudioFile)
+                        telegramAudioFile = processor.convertToTelegramAudio(sourceAudioFile)
                     } catch (e: Exception) {
                         logger.error("Failed to extract audio: ${e.message}", e)
                         editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to extract audio: ${e.message}")
@@ -477,7 +449,7 @@ class Bot(
                     
                     try {
                         // Get dimensions for this chunk
-                        val chunkDimensions = getVideoDimensions(chunkFile)
+                        val chunkDimensions = probe.getVideoDimensions(chunkFile)
                         val (chunkWidth, chunkHeight, chunkDuration) = try {
                             chunkDimensions.split(",").map { it.toDouble().toInt() }
                         } catch (e: Exception) {
@@ -637,233 +609,11 @@ class Bot(
             ?: throw IllegalStateException("Resource $name is not found")
     }
 
-    private fun delayedDelete(fileToDelete: File) {
-        fileDeleteScope.delayedDelete(fileToDelete, logger) { e ->
-            errorNotificationService?.sendErrorNotification(e, "File Deletion: ${fileToDelete.absolutePath}")
-        }
-    }
-
     private fun extractFirstUrlByText(html: String, linkText: String): String? {
         val doc = Jsoup.parse(html)
         val element = doc.select("a:containsOwn($linkText)").first()
         return element?.attr("href")
     }
-
-    private suspend fun getMediaDuration(file: File): Int? = runInterruptible(virtualDispatcher) {
-        val command = listOf(
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0",
-            file.absolutePath
-        )
-        try {
-            val process = ProcessBuilder(command).redirectErrorStream(true).start()
-            val output = process.inputStream.bufferedReader().readText().trim()
-            process.waitFor()
-            output.toDoubleOrNull()?.toInt()
-        } catch (e: Exception) {
-            logger.warn("ffprobe duration failed for ${file.absolutePath}: ${e.message}")
-            null
-        }
-    }
-
-    private suspend fun getVideoDimensions(videoFile: File): String = runInterruptible(virtualDispatcher) {
-        logger.info("Running ffprobe for $videoFile...")
-        val command = listOf("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration", "-of", "csv=p=0:s=,", videoFile.absolutePath)
-
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true) // Merge error stream with output
-            .start()
-        val reader = BufferedReader(InputStreamReader(process.inputStream))
-        val lines = reader.readLines()
-        logger.info("Got ${lines.size} lines from ffprobe: $lines")
-        process.waitFor()
-
-        // Combine first two lines into one comma-separated line
-        if (lines.size >= 2) {
-            "${lines[0]},${lines[1]}"
-        } else {
-            lines.firstOrNull() ?: ""
-        }
-    }
-
-    private suspend fun getTotalFreezeDuration(videoFile: File, startTime: Double, duration: Double): Double = runInterruptible(virtualDispatcher) {
-        logger.info("Running ffmpeg for $videoFile to find freezes...")
-        val command = listOf(
-            "ffmpeg",
-            "-v", "error",
-            "-ss", startTime.toString(),
-            "-t", duration.toString(),
-            "-i", videoFile.absolutePath,
-            "-vf", "freezedetect=n=-30dB:d=1,metadata=mode=print:file=-",
-            "-map", "0:v:0",
-            "-f", "null",
-            "-"
-        )
-        logger.info(command.shellJoin())
-
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .start()
-
-        var totalFreezeDuration = 0.0
-        var openFreezeStart: Double? = null
-        val freezeStartPattern = Regex("lavfi\\.freezedetect\\.freeze_start=(\\d+\\.?\\d*)")
-        val freezeDurationPattern = Regex("lavfi\\.freezedetect\\.freeze_duration=(\\d+\\.?\\d*)")
-        val freezeEndPattern = Regex("lavfi\\.freezedetect\\.freeze_end=(\\d+\\.?\\d*)")
-
-        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-            reader.lineSequence().forEach { line ->
-                freezeStartPattern.find(line)?.let { openFreezeStart = it.groupValues[1].toDouble() }
-                freezeDurationPattern.find(line)?.let {
-                    totalFreezeDuration += it.groupValues[1].toDouble()
-                }
-                freezeEndPattern.find(line)?.let { openFreezeStart = null }
-            }
-        }
-
-        process.waitFor()
-        // If a freeze started but never ended within the clip, count from start to clip end.
-        openFreezeStart?.let { start ->
-            val ongoing = (duration - start).coerceAtLeast(0.0)
-            totalFreezeDuration += ongoing
-            logger.info("Open freeze from $start to clip end (+$ongoing)")
-        }
-        logger.info("Total Freeze Duration: $totalFreezeDuration")
-        totalFreezeDuration
-    }
-
-    private suspend fun getSceneChangeCount(videoFile: File, startTime: Double, duration: Double): Int = runInterruptible(virtualDispatcher) {
-        logger.info("Running ffmpeg for $videoFile to count scene changes...")
-        val command = listOf(
-            "ffmpeg",
-            "-v", "error",
-            "-ss", startTime.toString(),
-            "-t", duration.toString(),
-            "-i", videoFile.absolutePath,
-            "-vf", "select='gt(scene,0.05)',metadata=print:file=-",
-            "-map", "0:v:0",
-            "-an",
-            "-f", "null",
-            "-"
-        )
-        logger.info(command.shellJoin())
-
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .start()
-
-        var sceneCount = 0
-        val sceneScorePattern = Regex("lavfi\\.scene_score=")
-
-        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-            reader.lineSequence().forEach { line ->
-                if (sceneScorePattern.containsMatchIn(line)) sceneCount++
-            }
-        }
-
-        process.waitFor()
-        logger.info("Scene change count: $sceneCount")
-        sceneCount
-    }
-
-    /**
-     * Splits a video file into chunks using mkvmerge
-     * @param videoFile The video file to split
-     * @param outputPrefix The prefix for output chunk files
-     * @param chunkSizeMB The maximum size of each chunk in MB
-     * @return List of chunk files
-     */
-    private suspend fun splitVideoIntoChunks(videoFile: File, outputPrefix: String, chunkSizeMB: Int = this.chunkSizeMB): List<File> = runInterruptible(virtualDispatcher) {
-        logger.info("Splitting video file ${videoFile.absolutePath} into chunks of ${chunkSizeMB}MB...")
-        
-        val command = listOf(
-            "mkvmerge",
-            "--quiet",
-            "-o", outputPrefix,
-            "--split", "${chunkSizeMB}M",
-            videoFile.absolutePath
-        )
-
-        logger.info("Executing command: ${command.shellJoin()}")
-
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .start()
-
-        // --quiet suppresses progress/info; anything left is a warning or error.
-        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-            reader.lineSequence().forEach { line ->
-                if (line.isNotBlank()) logger.warn("mkvmerge: $line")
-            }
-        }
-        
-        val exitCode = process.waitFor()
-        if (exitCode != 0) {
-            logger.error("mkvmerge failed with exit code $exitCode")
-            throw RuntimeException("Failed to split video file using mkvmerge")
-        }
-        
-        // Find all chunk files
-        val outputDir = videoFile.parentFile
-        val chunkPrefix = File(outputPrefix).nameWithoutExtension
-        logger.info("Looking for chunk files with prefix: $chunkPrefix in directory: ${outputDir.absolutePath}")
-        val chunkFiles = outputDir.listFiles { _, name -> name.startsWith(chunkPrefix) }?.toList() ?: emptyList()
-        
-        logger.info("Created ${chunkFiles.size} chunk files")
-        chunkFiles.forEach { file -> logger.info("Chunk file: ${file.absolutePath}") }
-
-        chunkFiles.sortedBy { it.name }
-    }
-
-    /**
-     * Extracts audio from a file for Telegram using ffmpeg
-     * @param inputFile The input video/audio file
-     * @return The extracted audio file
-     */
-    private suspend fun convertToTelegramAudio(inputFile: File): File = runInterruptible(virtualDispatcher) {
-        logger.info("Extracting audio from ${inputFile.absolutePath} for Telegram...")
-        
-        // Create output file with .m4a extension in the same directory (Telegram supports m4a)
-        val outputFile = File(inputFile.parentFile, "${UUID.randomUUID()}_telegram_audio.m4a")
-        
-        // Simple command to extract audio without conversion
-        val command = listOf(
-            "ffmpeg",
-            "-hide_banner", "-nostats", "-loglevel", "error",
-            "-i", inputFile.absolutePath,
-            "-vn",                   // Extract audio only
-            "-acodec", "copy",      // Copy audio without re-encoding
-            outputFile.absolutePath
-        )
-
-        logger.info("Executing ffmpeg command: ${command.shellJoin()}")
-
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .start()
-
-        // Read and log output (only surfaces real errors thanks to -loglevel error)
-        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-            reader.lineSequence().forEach { line ->
-                if (line.isNotBlank()) logger.warn("ffmpeg: $line")
-            }
-        }
-        
-        val exitCode = process.waitFor()
-        if (exitCode != 0) {
-            logger.error("ffmpeg failed with exit code $exitCode")
-            throw RuntimeException("Failed to extract audio using ffmpeg")
-        }
-        
-        logger.info("Successfully extracted audio to ${outputFile.absolutePath}")
-
-        // Register the file for delayed deletion
-        delayedDelete(outputFile)
-
-        outputFile
-    }
-
 
     private suspend fun editMessageText(chatId: Long, messageId: Int, newText: String) {
         val editMessage = EditMessageText.builder()
