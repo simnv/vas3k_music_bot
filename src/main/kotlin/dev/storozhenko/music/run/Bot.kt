@@ -207,8 +207,6 @@ class Bot(
             return
         }
 
-        val from = update.message.from.userName
-        val fromId = update.message.from.id
         lateinit var linksMessage: String
         if (!links.isEmpty()) {
             linksMessage = if (links.size == 1) {
@@ -246,7 +244,7 @@ class Bot(
         logger.info("Sending message: $message")
         // Send message with source info to error notification service
         val authorUsername = update.message.from?.userName
-        val authorName = update.message.from?.firstName + (update.message.from?.lastName?.let { " $it" } ?: "")
+        val authorName = update.message.from?.let { listOfNotNull(it.firstName, it.lastName).joinToString(" ").ifBlank { null } }
         val chatTitle = update.message.chat.title ?: "Private Chat"
         errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle, requestMode)
 
