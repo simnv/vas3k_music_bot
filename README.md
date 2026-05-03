@@ -310,6 +310,11 @@ Send a supported link in an authorized chat. Optionally add a quality keyword an
 
 Single-letter aliases (`l`/`m`/`h`) are only recognized at the start or end of the message.
 
+Force audio-only delivery (skip video analysis) with any of:
+
+- `audio` / `au` / `sound` / `snd`
+- `a` / `s` (only at the start or end of the message)
+
 ## Supported Platforms
 
 ### Music Link Parsing (via Odesli)

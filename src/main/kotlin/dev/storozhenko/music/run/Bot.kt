@@ -111,6 +111,18 @@ class Bot(
         } ?: Quality.MEDIUM
     }
 
+    private fun parseForceAudio(text: String): Boolean {
+        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return false
+        val lastIdx = tokens.size - 1
+        return tokens.withIndex().any { (i, raw) ->
+            val tok = raw.lowercase()
+            val atBoundary = i == 0 || i == lastIdx
+            tok == "audio" || tok == "au" || tok == "sound" || tok == "snd" ||
+                (atBoundary && (tok == "a" || tok == "s"))
+        }
+    }
+
     private inner class ChatActionPulser(private val chatId: Long, initialAction: String) : Closeable {
         @Volatile private var action: String = initialAction
         private val job: Job = coroutine.launch {
@@ -227,24 +239,27 @@ class Bot(
 
         val message = "$linksMessage"
 
+        val quality = parseQuality(update.message.text)
+        val forceAudio = parseForceAudio(update.message.text)
+        val requestMode = if (forceAudio) "audio (forced)" else quality.label
+
         logger.info("Sending message: $message")
         // Send message with source info to error notification service
         val authorUsername = update.message.from?.userName
         val authorName = update.message.from?.firstName + (update.message.from?.lastName?.let { " $it" } ?: "")
         val chatTitle = update.message.chat.title ?: "Private Chat"
-        errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle)
+        errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle, requestMode)
 
         val replyToMessageId = update.message.getMessageId()
         val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview(); disableNotification() })
         val tmId = textMessage.messageId
 
-        val quality = parseQuality(update.message.text)
         val yturl = youtubeFromMessage ?: ytSearchUrl
         val success = if (yturl != null) {
-            downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId, quality, pulser)
+            downloadAndSendVideo(yturl, message, tmId, replyToMessageId, chatId, quality, forceAudio, pulser)
         } else if (!validLinks.isEmpty()) {
             val validurl = validLinks.first().text
-            downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId, quality, pulser)
+            downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId, quality, forceAudio, pulser)
         } else {
             // No video to download, but we have Odesli information
             // Keep the text message with Odesli information
@@ -262,7 +277,7 @@ class Bot(
         }
     }
 
-    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, pulser: ChatActionPulser): Boolean {
+    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, forceAudio: Boolean, pulser: ChatActionPulser): Boolean {
         var downloadedFile: File? = null
         var thumbnailFile: File? = null
         var chunkFiles: List<File> = emptyList()
@@ -270,7 +285,7 @@ class Bot(
 
         try {
             pulser.set("typing")
-            editMessageText(chatId, intermediateMessageId, "$message\nDownloading (${quality.label} — use low/medium/high after link to change)...")
+            editMessageText(chatId, intermediateMessageId, "$message\nDownloading (${quality.label} — use low/medium/high or audio after link to change)...")
             val ipVersionParam = getIpVersionParam(url)
             val downloadParams = mutableListOf<String>().apply {
                 ipVersionParam?.let { add(it) }
@@ -361,16 +376,48 @@ class Bot(
                 chunkFiles = listOf(downloadedFile)
             }
             
-            // Send audio if it's a music chat
-            if (idHasMusic) {
+            // Decide audio vs video for music chats / forceAudio (non-music chats always get video)
+            if (idHasMusic || forceAudio) {
+                if (forceAudio) {
+                    logger.info("forceAudio set, skipping video analysis")
+                    sendVideo = false
+                } else {
+                    pulser.set("typing")
+                    editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
+                    val windows: List<Pair<Double, Double>> = when {
+                        videoDuration <= 30 -> listOf(0.0 to videoDuration.toDouble())
+                        videoDuration > 60 -> {
+                            val start = 30.0
+                            val span = videoDuration - 30.0
+                            listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (start + span * it) to 5.0 }
+                        }
+                        else -> listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (videoDuration * it) to 5.0 }
+                    }
+                    logger.info("${downloadedFile.absolutePath} duration=${videoDuration}s, analysis windows=$windows")
+                    val totalSceneCount = windows.sumOf { (s, d) -> getSceneChangeCount(downloadedFile, s, d) }
+                    sendVideo = if (totalSceneCount >= 2) {
+                        logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount >= 2, treating as moving")
+                        true
+                    } else {
+                        val totalFreezeDuration = windows.sumOf { (s, d) -> getTotalFreezeDuration(downloadedFile, s, d) }
+                        val totalAnalyzed = windows.sumOf { (_, d) -> d }
+                        val ratio = totalFreezeDuration / totalAnalyzed
+                        logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount, totalFreezeDuration / totalAnalyzed = $totalFreezeDuration / $totalAnalyzed = $ratio")
+                        ratio < 0.5
+                    }
+                }
+            }
+
+            // Send audio if decision was audio (not video)
+            if (!sendVideo) {
                 logger.info("Sending Audio...")
                 editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
                 pulser.set("upload_voice")
-                
+
                 try {
                     // For audio, we'll use the original file (first chunk) but convert it to Telegram-compatible format
                     val sourceAudioFile = chunkFiles.first()
-                    
+
                     // Extract audio for Telegram
                     editMessageText(chatId, intermediateMessageId, "$message\nExtracting audio...")
                     try {
@@ -380,7 +427,7 @@ class Bot(
                         editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to extract audio: ${e.message}")
                         return false
                     }
-                    
+
                     val audioBuilder = SendAudio.builder()
                         .audio(InputFile(telegramAudioFile))
                         .duration(videoDuration)
@@ -391,12 +438,12 @@ class Bot(
                         .title(title)
                         .chatId(chatId)
                         .replyToMessageId(rmid)
-                    
+
                     // Only add thumbnail if it exists
                     thumbnailFile?.let {
                         audioBuilder.thumbnail(InputFile(it))
                     }
-                    
+
                     val audio = audioBuilder.build()
                     val audioMessage = telegramClient.execute(audio)
                     logger.info("Audio sent successfully")
@@ -404,30 +451,6 @@ class Bot(
                     logger.error("Failed to send audio: ${e.message}", e)
                     editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send audio: ${e.message}")
                     return false
-                }
-                
-                pulser.set("typing")
-                editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-                val windows: List<Pair<Double, Double>> = when {
-                    videoDuration <= 30 -> listOf(0.0 to videoDuration.toDouble())
-                    videoDuration > 60 -> {
-                        val start = 30.0
-                        val span = videoDuration - 30.0
-                        listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (start + span * it) to 5.0 }
-                    }
-                    else -> listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (videoDuration * it) to 5.0 }
-                }
-                logger.info("${downloadedFile.absolutePath} duration=${videoDuration}s, analysis windows=$windows")
-                val totalSceneCount = windows.sumOf { (s, d) -> getSceneChangeCount(downloadedFile, s, d) }
-                sendVideo = if (totalSceneCount >= 2) {
-                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount >= 2, treating as moving")
-                    true
-                } else {
-                    val totalFreezeDuration = windows.sumOf { (s, d) -> getTotalFreezeDuration(downloadedFile, s, d) }
-                    val totalAnalyzed = windows.sumOf { (_, d) -> d }
-                    val ratio = totalFreezeDuration / totalAnalyzed
-                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount, totalFreezeDuration / totalAnalyzed = $totalFreezeDuration / $totalAnalyzed = $ratio")
-                    ratio < 0.5
                 }
             }
 

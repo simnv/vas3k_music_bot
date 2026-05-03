@@ -81,16 +81,25 @@ class ErrorNotificationService(
     fun sendServiceErrorNotification(throwable: Throwable, serviceName: String) {
         sendErrorNotification(throwable, "Service Error: $serviceName")
     }
-    public fun sendMessageWithSourceInfo(message: String, authorUsername: String?, chatId: Long, messageId: Int, chatTitle: String) {
+    public fun sendMessageWithSourceInfo(message: String, authorName: String?, authorUsername: String?, chatId: Long, messageId: Int, chatTitle: String, requestMode: String? = null) {
         try {
             val timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now())
+            val chatLinkId = chatId.toString().removePrefix("-100")
             val notificationMessage = buildString {
                 append("ℹ️ <b>Request from</b> ")
-                
-                authorUsername?.let { username ->
-                    append("@$username")
+
+                if (authorName != null && authorUsername != null) {
+                    append("$authorName (@$authorUsername)")
+                } else if (authorName != null) {
+                    append(authorName)
+                } else if (authorUsername != null) {
+                    append("@$authorUsername")
                 }
-                append(" in <a href=\"https://t.me/c/${chatId.toString().replace("-", "")}/${messageId}\">$chatTitle</a>")
+
+                append(" in <a href=\"https://t.me/c/$chatLinkId/$messageId\">$chatTitle</a>")
+                if (requestMode != null) {
+                    append("\n<b>Mode:</b> <code>$requestMode</code>")
+                }
                 append("\n\n$message")
             }
             
@@ -108,3 +117,4 @@ class ErrorNotificationService(
         }
     }
 }
+
