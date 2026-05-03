@@ -8,6 +8,7 @@ import dev.storozhenko.music.delayedDelete
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.parseRequestOptions
 import dev.storozhenko.music.removeFirstLine
+import dev.storozhenko.music.services.DownloadService
 import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.OdesilService
 import dev.storozhenko.music.services.UrlValidator
@@ -66,11 +67,11 @@ class Bot(
     private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
     private val odesilService = OdesilService()
     private val urlValidator = UrlValidator()
+    private val downloader: DownloadService
     val handler = CoroutineExceptionHandler { _, exception ->
         logger.error("Caught exception: $exception")
         errorNotificationService?.sendErrorNotification(exception)
     }
-    private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
     private val virtualDispatcher = Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()
     private val coroutine = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
     private val helpMessage = getResource("help_message.txt")
@@ -80,31 +81,15 @@ class Bot(
         .associate { (id, prefix) -> id.toLong() to prefix }
     private val fileDeleteScope = CoroutineScope(Dispatchers.Default + SupervisorJob() + handler)
     private val processorScope = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
-    
-    private fun getIpVersionParam(url: String): String? {
-        if (ipv6UrlContains.isNullOrEmpty()) {
-            return null
-        }
 
-        val urlContainsList = ipv6UrlContains.split(",").map { it.trim() }
-        return if (urlContainsList.any { url.contains(it, ignoreCase = true) }) {
-            "-6"
-        } else {
-            "-4"
-        }
+    init {
+        downloader = DownloadService(
+            ytdlLocation, virtualDispatcher, fileDeleteScope,
+            ipv6UrlContains, ytdlProxy, ytdlProxyUrlContains,
+            errorNotificationService
+        )
     }
 
-    private fun getProxyParams(url: String): List<String> {
-        if (ytdlProxy.isNullOrEmpty() || ytdlProxyUrlContains.isNullOrEmpty()) {
-            return emptyList()
-        }
-        val urlContainsList = ytdlProxyUrlContains.split(",").map { it.trim() }
-        return if (urlContainsList.any { url.contains(it, ignoreCase = true) }) {
-            listOf("--proxy", ytdlProxy)
-        } else {
-            emptyList()
-        }
-    }
 
     private inner class ChatActionPulser(private val chatId: Long, initialAction: String) : Closeable {
         @Volatile private var action: String = initialAction
@@ -199,7 +184,7 @@ class Bot(
             }
         } else if (!validLinks.isEmpty()) {
             val validLink = validLinks.first()
-            val videoTitle = getVideoTitle(validLink.text)
+            val videoTitle = downloader.getVideoTitle(validLink.text)
             linksMessage = "$videoTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
         }
 
@@ -210,7 +195,7 @@ class Bot(
             val query = listOfNotNull(data?.artistName, data?.title)
                 .filter { it.isNotBlank() }
                 .joinToString(" ")
-            if (query.isNotBlank()) ytSearchFirst(query) else null
+            if (query.isNotBlank()) downloader.ytSearchFirst(query) else null
         } else null
         if (ytSearchUrl != null) {
             val ytLink = "<a href=\"$ytSearchUrl\">YouTube search</a>"
@@ -261,36 +246,6 @@ class Bot(
         }
     }
 
-    private fun commonYtDlpFlags(url: String): List<String> = buildList {
-        getIpVersionParam(url)?.let { add(it) }
-        addAll(getProxyParams(url))
-        addAll(listOf(
-            "--cookies", "/cookies.txt",
-            "-I", "0",
-            "--playlist-items", "1",
-            "--write-thumbnail",
-            "--embed-thumbnail",
-            "--convert-thumbnails", "jpg",
-            "--js-runtimes", "deno:/usr/bin/deno",
-            "--remote-components", "ejs:github",
-            "--retries", "5",
-            "--fragment-retries", "5",
-            "--socket-timeout", "30"
-        ))
-    }
-
-    private fun resolveSiblingThumbnail(mediaFile: File): File? {
-        val candidate = mediaFile.changeExtension("jpg")
-        if (!candidate.exists()) return null
-        val (isValid, msg) = validateThumbnailFile(candidate)
-        if (!isValid) {
-            logger.warn("Thumbnail validation failed: $msg. Continuing without thumbnail.")
-            return null
-        }
-        delayedDelete(candidate)
-        return candidate
-    }
-
     private suspend fun sendAudioInPlace(
         audioFile: File,
         chatId: Long,
@@ -323,14 +278,14 @@ class Bot(
         try {
             pulser.set("typing")
             editMessageText(chatId, intermediateMessageId, "$message\nDownloading audio...")
-            val downloadParams = commonYtDlpFlags(url) + listOf("-f", "bestaudio[ext=m4a]/bestaudio")
-            downloadedFile = download("${UUID.randomUUID()}.%(ext)s", url, *downloadParams.toTypedArray())
+            val downloadParams = downloader.commonYtDlpFlags(url) + listOf("-f", "bestaudio[ext=m4a]/bestaudio")
+            downloadedFile = downloader.download("${UUID.randomUUID()}.%(ext)s", url, *downloadParams.toTypedArray())
                 ?: run {
                     editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download audio: empty result")
                     return false
                 }
 
-            thumbnailFile = resolveSiblingThumbnail(downloadedFile)
+            thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
             val duration = getMediaDuration(downloadedFile)
 
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
@@ -372,11 +327,11 @@ class Bot(
         try {
             pulser.set("typing")
             editMessageText(chatId, intermediateMessageId, "$message\nDownloading ${quality.label}... Use <code>low</code>/<code>medium</code>/<code>high</code> or <code>audio</code> after link to change.")
-            val downloadParams = commonYtDlpFlags(url) + listOf(
+            val downloadParams = downloader.commonYtDlpFlags(url) + listOf(
                 "-f", quality.formatSelector,
                 "--merge-output-format", "mp4"
             )
-            downloadedFile = download(
+            downloadedFile = downloader.download(
                 "${UUID.randomUUID()}.%(ext)s",
                 url,
                 *downloadParams.toTypedArray()
@@ -398,7 +353,7 @@ class Bot(
             val fileSizeInMB = fileSizeInBytes / (1024.0 * 1024.0)
             logger.info("Downloaded file size: ${String.format("%.2f", fileSizeInMB)} MB (${fileSizeInBytes} bytes)")
             
-            thumbnailFile = resolveSiblingThumbnail(downloadedFile)
+            thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
             
             editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
             val dimensions = getVideoDimensions(downloadedFile)
@@ -688,35 +643,6 @@ class Bot(
         }
     }
 
-    private suspend fun download(filename: String, url: String, vararg params: String): File? = runInterruptible(virtualDispatcher) {
-        logger.info("Running yt-dlp for $url...")
-        val folderName = UUID.randomUUID().toString()
-        val folder = File("/tmp", folderName).apply { mkdir() }
-        val command = listOf(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename") + params.toList()
-        logger.info(command.shellJoin())
-        val process =
-            ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .start()
-        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-            reader.lineSequence().forEach { logger.info(it) }
-        }
-        process.waitFor()
-        logger.info("Finished running yt-dlp for $url")
-        val files = folder.listFiles()
-        if (files == null || files.isEmpty()) {
-            logger.error("Can't download file for url $url")
-            return@runInterruptible null
-        }
-        val mediaFile = files.firstOrNull { it.extension.lowercase() !in IMAGE_EXTENSIONS }
-            ?: run {
-                logger.error("No media file found for url $url, only: ${files.map { it.name }}")
-                return@runInterruptible null
-            }
-        delayedDelete(mediaFile)
-        mediaFile
-    }
-
     private fun extractFirstUrlByText(html: String, linkText: String): String? {
         val doc = Jsoup.parse(html)
         val element = doc.select("a:containsOwn($linkText)").first()
@@ -839,73 +765,6 @@ class Bot(
         process.waitFor()
         logger.info("Scene change count: $sceneCount")
         sceneCount
-    }
-
-    private suspend fun ytSearchFirst(query: String): String? = runInterruptible(virtualDispatcher) {
-        logger.info("Running yt-dlp ytsearch for: $query")
-        val command = listOf(
-            "yt-dlp",
-            "--cookies", "/cookies.txt",
-            "--print", "%(webpage_url)s",
-            "--skip-download",
-            "--js-runtimes", "deno:/usr/bin/deno",
-            "--remote-components", "ejs:github",
-            "--retries", "5",
-            "--fragment-retries", "5",
-            "--socket-timeout", "30",
-            "ytsearch1:$query"
-        )
-        logger.info(command.shellJoin())
-        try {
-            val process = ProcessBuilder(command).redirectErrorStream(true).start()
-            val output = process.inputStream.bufferedReader().readText().trim()
-            process.waitFor()
-            logger.info("ytsearch output: $output")
-            output.lineSequence().firstOrNull { it.startsWith("http") }
-        } catch (e: Exception) {
-            logger.error("ytsearch failed for $query", e)
-            null
-        }
-    }
-
-    private suspend fun getVideoTitle(url: String): String = runInterruptible(virtualDispatcher) {
-        logger.info("Running yt-dlp to get title and duration for $url...")
-        val ipVersionParam = getIpVersionParam(url)
-        val command = mutableListOf<String>().apply {
-            addAll(listOf(
-                "yt-dlp",
-                "--cookies", "/cookies.txt",
-                "--print", "%(title)s [%(duration)s]",
-                "--js-runtimes", "deno:/usr/bin/deno",
-                "--remote-components", "ejs:github",
-                "--retries", "5",
-                "--fragment-retries", "5",
-                "--socket-timeout", "30"
-            ))
-            ipVersionParam?.let { add(it) }
-            addAll(getProxyParams(url))
-            add(url)
-        }
-        logger.info(command.shellJoin())
-
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true) // Merge error stream with output
-            .start()
-        val reader = BufferedReader(InputStreamReader(process.inputStream))
-        val output = reader.readLine() // Read first line of output
-        logger.info("Got $output from yt-dlp")
-        process.waitFor()
-        if (output.contains(": No video formats found!")) {
-            return@runInterruptible ""
-        }
-
-        // Format the duration from seconds to MM:SS
-        output.replace(Regex("\\[(\\d+)\\]")) { matchResult ->
-            val seconds = matchResult.groupValues[1].toInt()
-            val minutes = seconds / 60
-            val remainingSeconds = seconds % 60
-            " [%02d:%02d]".format(minutes, remainingSeconds)
-        }
     }
 
     /**
