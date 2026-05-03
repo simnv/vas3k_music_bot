@@ -17,7 +17,6 @@ import kotlin.time.Duration.Companion.minutes
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
 import org.telegram.telegrambots.meta.api.methods.send.SendChatAction
-import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage
 import org.telegram.telegrambots.meta.api.methods.ActionType
 import org.telegram.telegrambots.meta.api.objects.MessageEntity
 import org.telegram.telegrambots.meta.api.objects.Update
@@ -25,6 +24,9 @@ import org.telegram.telegrambots.meta.generics.TelegramClient
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo
 import org.telegram.telegrambots.meta.api.methods.send.SendAudio
 import org.telegram.telegrambots.meta.api.objects.InputFile
+import org.telegram.telegrambots.meta.api.objects.media.InputMediaAudio
+import org.telegram.telegrambots.meta.api.objects.media.InputMediaVideo
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageMedia
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
@@ -264,12 +266,8 @@ class Bot(
             false
         }
 
-        if (success) {
-            logger.info("Deleting intermediate text message $tmId")
-            telegramClient.execute(DeleteMessage(chatId.toString(), tmId))
-        } else {
-            logger.info("Not deleting intermediate text message $tmId - keeping Odesli information")
-        }
+        // Status message is now consumed in-place via EditMessageMedia on success,
+        // and shows the error text on failure. No delete needed in either case.
         } finally {
             pulser.close()
         }
@@ -283,7 +281,7 @@ class Bot(
 
         try {
             pulser.set("typing")
-            editMessageText(chatId, intermediateMessageId, "$message\nDownloading (${quality.label} — use low/medium/high or audio after link to change)...")
+            editMessageText(chatId, intermediateMessageId, "$message\nDownloading ${quality.label}... Use <code>low</code>/<code>medium</code>/<code>high</code> or <code>audio</code> after link to change.")
             val ipVersionParam = getIpVersionParam(url)
             val downloadParams = mutableListOf<String>().apply {
                 ipVersionParam?.let { add(it) }
@@ -426,25 +424,23 @@ class Bot(
                         return false
                     }
 
-                    val audioBuilder = SendAudio.builder()
-                        .audio(InputFile(telegramAudioFile))
-                        .duration(videoDuration)
-                        .caption(message.removeFirstLine())
-                        .parseMode("HTML")
-                        .disableNotification(true)
-                        .performer(artist)
-                        .title(title)
-                        .chatId(chatId)
-                        .replyToMessageId(rmid)
-
-                    // Only add thumbnail if it exists
-                    thumbnailFile?.let {
-                        audioBuilder.thumbnail(InputFile(it))
+                    val outerArtist = artist
+                    val outerTitle = title
+                    val audioMedia = InputMediaAudio(telegramAudioFile, "audio").also {
+                        it.caption = message.removeFirstLine()
+                        it.parseMode = "HTML"
+                        it.duration = videoDuration
+                        it.performer = outerArtist
+                        it.title = outerTitle
+                        thumbnailFile?.let { tf -> it.thumbnail = InputFile(tf) }
                     }
-
-                    val audio = audioBuilder.build()
-                    val audioMessage = telegramClient.execute(audio)
-                    logger.info("Audio sent successfully")
+                    val edit = EditMessageMedia.builder()
+                        .chatId(chatId.toString())
+                        .messageId(intermediateMessageId)
+                        .media(audioMedia)
+                        .build()
+                    telegramClient.execute(edit)
+                    logger.info("Audio sent (status morphed in place)")
                 } catch (e: TelegramApiException) {
                     logger.error("Failed to send audio: ${e.message}", e)
                     editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send audio: ${e.message}")
@@ -487,27 +483,46 @@ class Bot(
                             message
                         }
                         
-                        val videoBuilder = SendVideo.builder()
-                            .video(InputFile(chunkFile))
-                            .width(chunkWidth)
-                            .height(chunkHeight)
-                            .duration(chunkDuration)
-                            .caption(chunkCaption)
-                            .parseMode("HTML")
-                            .showCaptionAboveMedia(true)
-                            .supportsStreaming(true)
-                            .disableNotification(true)
-                            .chatId(chatId)
-                            .replyToMessageId(rmid)
-                        
-                        // Only add thumbnail and cover if they exist
-                        thumbnailFile?.let {
-                            videoBuilder.thumbnail(InputFile(it))
-                            videoBuilder.cover(InputFile(it))
+                        if (chunkNumber == 1) {
+                            // Replace status text with the first chunk in place — no flicker, one fewer round-trip.
+                            val videoMedia = InputMediaVideo(chunkFile, "video").also {
+                                it.caption = chunkCaption
+                                it.parseMode = "HTML"
+                                it.width = chunkWidth
+                                it.height = chunkHeight
+                                it.duration = chunkDuration
+                                it.supportsStreaming = true
+                                it.showCaptionAboveMedia = true
+                                thumbnailFile?.let { tf ->
+                                    it.thumbnail = InputFile(tf)
+                                    it.cover = InputFile(tf)
+                                }
+                            }
+                            val edit = EditMessageMedia.builder()
+                                .chatId(chatId.toString())
+                                .messageId(intermediateMessageId)
+                                .media(videoMedia)
+                                .build()
+                            telegramClient.execute(edit)
+                        } else {
+                            val videoBuilder = SendVideo.builder()
+                                .video(InputFile(chunkFile))
+                                .width(chunkWidth)
+                                .height(chunkHeight)
+                                .duration(chunkDuration)
+                                .caption(chunkCaption)
+                                .parseMode("HTML")
+                                .showCaptionAboveMedia(true)
+                                .supportsStreaming(true)
+                                .disableNotification(true)
+                                .chatId(chatId)
+                                .replyToMessageId(rmid)
+                            thumbnailFile?.let {
+                                videoBuilder.thumbnail(InputFile(it))
+                                videoBuilder.cover(InputFile(it))
+                            }
+                            telegramClient.execute(videoBuilder.build())
                         }
-                        
-                        val video = videoBuilder.build()
-                        telegramClient.execute(video)
                         logger.info("Video chunk $chunkNumber sent successfully")
                         
                         // Add a small delay between sending chunks to avoid rate limiting
