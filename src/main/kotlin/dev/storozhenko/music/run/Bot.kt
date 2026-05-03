@@ -9,20 +9,25 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.future.await
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.runInterruptible
 import java.io.Closeable
 import kotlin.time.Duration.Companion.minutes
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
 import org.telegram.telegrambots.meta.api.methods.send.SendChatAction
-import org.telegram.telegrambots.meta.api.methods.ActionType
+import org.telegram.telegrambots.meta.api.objects.LinkPreviewOptions
 import org.telegram.telegrambots.meta.api.objects.MessageEntity
 import org.telegram.telegrambots.meta.api.objects.Update
 import org.telegram.telegrambots.meta.generics.TelegramClient
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo
-import org.telegram.telegrambots.meta.api.methods.send.SendAudio
 import org.telegram.telegrambots.meta.api.objects.InputFile
 import org.telegram.telegrambots.meta.api.objects.media.InputMediaAudio
 import org.telegram.telegrambots.meta.api.objects.media.InputMediaVideo
@@ -31,6 +36,7 @@ import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageTe
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.Executors
 import org.jsoup.Jsoup
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -54,14 +60,15 @@ class Bot(
         logger.error("Caught exception: $exception")
         errorNotificationService?.sendErrorNotification(exception)
     }
-    private val coroutine = CoroutineScope(Dispatchers.IO + SupervisorJob() + handler)
+    private val virtualDispatcher = Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()
+    private val coroutine = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
     private val helpMessage = getResource("help_message.txt")
     private val chatsAndPlaylistNames = telegramAllowList
         .split(",")
         .map { line -> line.split(":") }
         .associate { (id, prefix) -> id.toLong() to prefix }
-    private val fileDeleteScope = CoroutineScope(Dispatchers.Default)
-    private val processorScope = CoroutineScope(Dispatchers.Default)
+    private val fileDeleteScope = CoroutineScope(Dispatchers.Default + SupervisorJob() + handler)
+    private val processorScope = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
     
     private fun getIpVersionParam(url: String): String? {
         if (ipv6UrlContains.isNullOrEmpty()) {
@@ -94,35 +101,34 @@ class Bot(
         HIGH("best", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best")
     }
 
-    private fun parseQuality(text: String): Quality {
-        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        if (tokens.isEmpty()) return Quality.MEDIUM
-        val lastIdx = tokens.size - 1
-        return tokens.withIndex().firstNotNullOfOrNull { (i, raw) ->
-            val tok = raw.lowercase()
-            val atBoundary = i == 0 || i == lastIdx
-            when {
-                tok == "low" -> Quality.LOW
-                tok == "medium" || tok == "med" || tok == "mid" -> Quality.MEDIUM
-                tok == "high" || tok == "hi" -> Quality.HIGH
-                atBoundary && tok == "l" -> Quality.LOW
-                atBoundary && tok == "m" -> Quality.MEDIUM
-                atBoundary && tok == "h" -> Quality.HIGH
-                else -> null
-            }
-        } ?: Quality.MEDIUM
-    }
+    private data class RequestOptions(val quality: Quality, val forceAudio: Boolean)
 
-    private fun parseForceAudio(text: String): Boolean {
+    private fun parseRequestOptions(text: String): RequestOptions {
         val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        if (tokens.isEmpty()) return false
+        if (tokens.isEmpty()) return RequestOptions(Quality.MEDIUM, false)
         val lastIdx = tokens.size - 1
-        return tokens.withIndex().any { (i, raw) ->
+        var quality: Quality? = null
+        var forceAudio = false
+        tokens.forEachIndexed { i, raw ->
             val tok = raw.lowercase()
             val atBoundary = i == 0 || i == lastIdx
-            tok == "audio" || tok == "au" || tok == "sound" || tok == "snd" ||
-                (atBoundary && (tok == "a" || tok == "s"))
+            if (quality == null) {
+                quality = when {
+                    tok == "low" -> Quality.LOW
+                    tok == "medium" || tok == "med" || tok == "mid" -> Quality.MEDIUM
+                    tok == "high" || tok == "hi" -> Quality.HIGH
+                    atBoundary && tok == "l" -> Quality.LOW
+                    atBoundary && tok == "m" -> Quality.MEDIUM
+                    atBoundary && tok == "h" -> Quality.HIGH
+                    else -> null
+                }
+            }
+            if (!forceAudio) {
+                forceAudio = tok == "audio" || tok == "au" || tok == "sound" || tok == "snd" ||
+                    (atBoundary && (tok == "a" || tok == "s"))
+            }
         }
+        return RequestOptions(quality ?: Quality.MEDIUM, forceAudio)
     }
 
     private inner class ChatActionPulser(private val chatId: Long, initialAction: String) : Closeable {
@@ -130,7 +136,7 @@ class Bot(
         private val job: Job = coroutine.launch {
             while (isActive) {
                 try {
-                    telegramClient.execute(SendChatAction(chatId.toString(), action))
+                    telegramClient.executeAsync(SendChatAction(chatId.toString(), action)).await()
                 } catch (e: Exception) {
                     logger.info("Failed to send chat action: ${e.message}")
                 }
@@ -158,7 +164,7 @@ class Bot(
         }
     }
 
-    private fun consume(update: Update) {
+    private suspend fun consume(update: Update) {
         if (!update.hasMessage() || !update.message.hasText()) {
             logger.info("Got an update without text")
             return
@@ -239,8 +245,7 @@ class Bot(
 
         val message = "$linksMessage"
 
-        val quality = parseQuality(update.message.text)
-        val forceAudio = parseForceAudio(update.message.text)
+        val (quality, forceAudio) = parseRequestOptions(update.message.text)
         val requestMode = if (forceAudio) "audio (forced)" else quality.label
 
         logger.info("Sending message: $message")
@@ -251,7 +256,15 @@ class Bot(
         errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle, requestMode)
 
         val replyToMessageId = update.message.getMessageId()
-        val textMessage = telegramClient.execute(SendMessage(chatId.toString(), message).apply { enableHtml(true); setReplyToMessageId(replyToMessageId); disableWebPagePreview(); disableNotification() })
+        val sendMessage = SendMessage.builder()
+            .chatId(chatId.toString())
+            .text(message)
+            .parseMode("HTML")
+            .replyToMessageId(replyToMessageId)
+            .linkPreviewOptions(LinkPreviewOptions.builder().isDisabled(true).build())
+            .disableNotification(true)
+            .build()
+        val textMessage = telegramClient.executeAsync(sendMessage).await()
         val tmId = textMessage.messageId
 
         val yturl = youtubeFromMessage ?: ytSearchUrl
@@ -273,7 +286,7 @@ class Bot(
         }
     }
 
-    private fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, forceAudio: Boolean, pulser: ChatActionPulser): Boolean {
+    private suspend fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, forceAudio: Boolean, pulser: ChatActionPulser): Boolean {
         var downloadedFile: File? = null
         var thumbnailFile: File? = null
         var chunkFiles: List<File> = emptyList()
@@ -390,12 +403,16 @@ class Bot(
                         else -> listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (videoDuration * it) to 5.0 }
                     }
                     logger.info("${downloadedFile.absolutePath} duration=${videoDuration}s, analysis windows=$windows")
-                    val totalSceneCount = windows.sumOf { (s, d) -> getSceneChangeCount(downloadedFile, s, d) }
+                    val downloadedFileLocal = downloadedFile
+                    val (totalSceneCount, totalFreezeDuration) = coroutineScope {
+                        val sceneJobs = windows.map { (s, d) -> async { getSceneChangeCount(downloadedFileLocal, s, d) } }
+                        val freezeJobs = windows.map { (s, d) -> async { getTotalFreezeDuration(downloadedFileLocal, s, d) } }
+                        sceneJobs.awaitAll().sum() to freezeJobs.awaitAll().sum()
+                    }
                     sendVideo = if (totalSceneCount >= 2) {
                         logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount >= 2, treating as moving")
                         true
                     } else {
-                        val totalFreezeDuration = windows.sumOf { (s, d) -> getTotalFreezeDuration(downloadedFile, s, d) }
                         val totalAnalyzed = windows.sumOf { (_, d) -> d }
                         val ratio = totalFreezeDuration / totalAnalyzed
                         logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount, totalFreezeDuration / totalAnalyzed = $totalFreezeDuration / $totalAnalyzed = $ratio")
@@ -439,7 +456,7 @@ class Bot(
                         .messageId(intermediateMessageId)
                         .media(audioMedia)
                         .build()
-                    telegramClient.execute(edit)
+                    telegramClient.executeAsync(edit).await()
                     logger.info("Audio sent (status morphed in place)")
                 } catch (e: TelegramApiException) {
                     logger.error("Failed to send audio: ${e.message}", e)
@@ -503,7 +520,7 @@ class Bot(
                                 .messageId(intermediateMessageId)
                                 .media(videoMedia)
                                 .build()
-                            telegramClient.execute(edit)
+                            telegramClient.executeAsync(edit).await()
                         } else {
                             val videoBuilder = SendVideo.builder()
                                 .video(InputFile(chunkFile))
@@ -521,13 +538,13 @@ class Bot(
                                 videoBuilder.thumbnail(InputFile(it))
                                 videoBuilder.cover(InputFile(it))
                             }
-                            telegramClient.execute(videoBuilder.build())
+                            telegramClient.executeAsync(videoBuilder.build()).await()
                         }
                         logger.info("Video chunk $chunkNumber sent successfully")
-                        
+
                         // Add a small delay between sending chunks to avoid rate limiting
                         if (chunkNumber < totalChunks) {
-                            Thread.sleep(1000)
+                            delay(1000)
                         }
                     } catch (e: TelegramApiException) {
                         logger.error("Failed to send video chunk $chunkNumber: ${e.message}", e)
@@ -584,9 +601,9 @@ class Bot(
         }
     }
 
-    private fun sendHelp(update: Update) {
+    private suspend fun sendHelp(update: Update) {
         logger.info("sending help")
-        telegramClient.execute(SendMessage(update.message.chatId.toString(), helpMessage))
+        telegramClient.executeAsync(SendMessage(update.message.chatId.toString(), helpMessage)).await()
     }
 
     private val platformOrder = listOf(
@@ -627,14 +644,6 @@ class Bot(
             ?: throw IllegalStateException("Resource $name is not found")
     }
 
-    private fun downloadVideo(url: String, vararg params: String): File? {
-        return download("${UUID.randomUUID()}.%(ext)s", url, *params)
-    }
-
-    private fun downloadAudio(url: String, vararg params: String): File? {
-        return download("%(title)s.%(ext)s", url, "-x", "--audio-format", "mp3", "--no-playlist", *params)
-    }
-
     private fun delayedDelete(fileToDelete: File) {
         fileToDelete.deleteOnExit()
         fileDeleteScope.launch {
@@ -649,25 +658,29 @@ class Bot(
         }
     }
 
-    private fun download(filename: String, url: String, vararg params: String): File? {
+    private suspend fun download(filename: String, url: String, vararg params: String): File? = runInterruptible(virtualDispatcher) {
         logger.info("Running yt-dlp for $url...")
         val folderName = UUID.randomUUID().toString()
         val folder = File("/tmp", folderName).apply { mkdir() }
         logger.info(params.joinToString(" "))
         val process =
-            ProcessBuilder(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename", *params).start()
-        process.inputStream.reader(Charsets.UTF_8).use { logger.info(it.readText()) }
+            ProcessBuilder(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename", *params)
+                .redirectErrorStream(true)
+                .start()
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { logger.info(it) }
+        }
         process.waitFor()
         logger.info("Finished running yt-dlp for $url")
         val files = folder.listFiles()
         if (files == null || files.isEmpty()) {
             logger.error("Can't download file for url $url")
-            return null
+            return@runInterruptible null
         }
         var downloadedFile = files.first()
         downloadedFile = downloadedFile.changeExtension("mp4")
         delayedDelete(downloadedFile)
-        return downloadedFile
+        downloadedFile
     }
 
     private fun extractFirstUrlByText(html: String, linkText: String): String? {
@@ -681,7 +694,7 @@ class Bot(
         return this.resolveSibling(newName)
     }
 
-    private fun getVideoDimensions(videoFile: File): String {
+    private suspend fun getVideoDimensions(videoFile: File): String = runInterruptible(virtualDispatcher) {
         logger.info("Running ffprobe for $videoFile...")
         val command = listOf("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration", "-of", "csv=p=0:s=,", videoFile.absolutePath)
 
@@ -692,16 +705,16 @@ class Bot(
         val lines = reader.readLines()
         logger.info("Got ${lines.size} lines from ffprobe: $lines")
         process.waitFor()
-        
+
         // Combine first two lines into one comma-separated line
-        return if (lines.size >= 2) {
+        if (lines.size >= 2) {
             "${lines[0]},${lines[1]}"
         } else {
             lines.firstOrNull() ?: ""
         }
     }
 
-    private fun getTotalFreezeDuration(videoFile: File, startTime: Double, duration: Double): Double {
+    private suspend fun getTotalFreezeDuration(videoFile: File, startTime: Double, duration: Double): Double = runInterruptible(virtualDispatcher) {
         logger.info("Running ffmpeg for $videoFile to find freezes...")
         val command = listOf(
             "ffmpeg",
@@ -745,10 +758,10 @@ class Bot(
             logger.info("Open freeze from $start to clip end (+$ongoing)")
         }
         logger.info("Total Freeze Duration: $totalFreezeDuration")
-        return totalFreezeDuration
+        totalFreezeDuration
     }
 
-    private fun getSceneChangeCount(videoFile: File, startTime: Double, duration: Double): Int {
+    private suspend fun getSceneChangeCount(videoFile: File, startTime: Double, duration: Double): Int = runInterruptible(virtualDispatcher) {
         logger.info("Running ffmpeg for $videoFile to count scene changes...")
         val command = listOf(
             "ffmpeg",
@@ -780,10 +793,10 @@ class Bot(
 
         process.waitFor()
         logger.info("Scene change count: $sceneCount")
-        return sceneCount
+        sceneCount
     }
 
-    private fun ytSearchFirst(query: String): String? {
+    private suspend fun ytSearchFirst(query: String): String? = runInterruptible(virtualDispatcher) {
         logger.info("Running yt-dlp ytsearch for: $query")
         val command = listOf(
             "yt-dlp",
@@ -798,7 +811,7 @@ class Bot(
             "ytsearch1:$query"
         )
         logger.info(command.joinToString(" "))
-        return try {
+        try {
             val process = ProcessBuilder(command).redirectErrorStream(true).start()
             val output = process.inputStream.bufferedReader().readText().trim()
             process.waitFor()
@@ -810,7 +823,7 @@ class Bot(
         }
     }
 
-    private fun getVideoTitle(url: String): String {
+    private suspend fun getVideoTitle(url: String): String = runInterruptible(virtualDispatcher) {
         logger.info("Running yt-dlp to get title and duration for $url...")
         val ipVersionParam = getIpVersionParam(url)
         val command = mutableListOf<String>().apply {
@@ -838,18 +851,16 @@ class Bot(
         logger.info("Got $output from yt-dlp")
         process.waitFor()
         if (output.contains(": No video formats found!")) {
-            return ""
+            return@runInterruptible ""
         }
-        
+
         // Format the duration from seconds to MM:SS
-        val formattedOutput = output.replace(Regex("\\[(\\d+)\\]")) { matchResult ->
+        output.replace(Regex("\\[(\\d+)\\]")) { matchResult ->
             val seconds = matchResult.groupValues[1].toInt()
             val minutes = seconds / 60
             val remainingSeconds = seconds % 60
             " [%02d:%02d]".format(minutes, remainingSeconds)
         }
-        
-        return formattedOutput
     }
 
     data class DomainConfig(
@@ -939,23 +950,6 @@ class Bot(
             false
         }
 
-    private fun splitAudioAndVideo(videoFile: File, videoFileName: String, audioFileName: String): String {
-        logger.info("Running ffmpeg for splitting $videoFile...")
-        val command = listOf("ffmpeg", "-i", videoFile.absolutePath,
-            "-v", "error",
-            "-an", "-c:v", "copy", videoFileName,
-            "-vn", "-c:a", "copy", audioFileName)
-
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true) // Merge error stream with output
-            .start()
-        val reader = BufferedReader(InputStreamReader(process.inputStream))
-        val output = reader.readLine() // Read first line of output
-        logger.info("Got $output from ffprobe")
-        process.waitFor()
-        return output
-    }
-
     /**
      * Splits a video file into chunks using mkvmerge
      * @param videoFile The video file to split
@@ -963,7 +957,7 @@ class Bot(
      * @param chunkSizeMB The maximum size of each chunk in MB
      * @return List of chunk files
      */
-    private fun splitVideoIntoChunks(videoFile: File, outputPrefix: String, chunkSizeMB: Int = this.chunkSizeMB): List<File> {
+    private suspend fun splitVideoIntoChunks(videoFile: File, outputPrefix: String, chunkSizeMB: Int = this.chunkSizeMB): List<File> = runInterruptible(virtualDispatcher) {
         logger.info("Splitting video file ${videoFile.absolutePath} into chunks of ${chunkSizeMB}MB...")
         
         val command = listOf(
@@ -1000,16 +994,16 @@ class Bot(
         
         logger.info("Created ${chunkFiles.size} chunk files")
         chunkFiles.forEach { file -> logger.info("Chunk file: ${file.absolutePath}") }
-        
-        return chunkFiles.sortedBy { it.name }
+
+        chunkFiles.sortedBy { it.name }
     }
-    
+
     /**
      * Extracts audio from a file for Telegram using ffmpeg
      * @param inputFile The input video/audio file
      * @return The extracted audio file
      */
-    private fun convertToTelegramAudio(inputFile: File): File {
+    private suspend fun convertToTelegramAudio(inputFile: File): File = runInterruptible(virtualDispatcher) {
         logger.info("Extracting audio from ${inputFile.absolutePath} for Telegram...")
         
         // Create output file with .m4a extension in the same directory (Telegram supports m4a)
@@ -1044,28 +1038,28 @@ class Bot(
         }
         
         logger.info("Successfully extracted audio to ${outputFile.absolutePath}")
-        
+
         // Register the file for delayed deletion
         delayedDelete(outputFile)
-        
-        return outputFile
-    }
-    
 
-    private fun editMessageText(chatId: Long, messageId: Int, newText: String) {
+        outputFile
+    }
+
+
+    private suspend fun editMessageText(chatId: Long, messageId: Int, newText: String) {
         val editMessage = EditMessageText.builder()
             .chatId(chatId.toString())
             .messageId(messageId)
             .text(newText)
             .parseMode("HTML")
-            .disableWebPagePreview(true)
+            .linkPreviewOptions(LinkPreviewOptions.builder().isDisabled(true).build())
             .build()
 
         try {
-            telegramClient.execute(editMessage)
+            telegramClient.executeAsync(editMessage).await()
         } catch (e: TelegramApiException) {
             // Handle error (message might not exist or bot doesn't have permission)
-            println("Failed to edit message: ${e.message}")
+            logger.info("Failed to edit message: ${e.message}")
         }
     }
 }

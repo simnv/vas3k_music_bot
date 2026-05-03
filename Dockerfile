@@ -21,4 +21,4 @@ RUN apk update && apk add curl python3 bash ffmpeg mkvtoolnix mutagen deno \
 COPY --from=build /app/target/vas3k_music.jar /usr/local/lib/vas3k_music.jar
 # COPY --from=jauderho/yt-dlp:latest /usr/local/bin/yt-dlp /usr/local/bin
 
-ENTRYPOINT ["java","-Xmx32m","-jar","/usr/local/lib/vas3k_music.jar"]
+ENTRYPOINT ["java","-Xmx128m","-XX:+UseZGC","-jar","/usr/local/lib/vas3k_music.jar"]
