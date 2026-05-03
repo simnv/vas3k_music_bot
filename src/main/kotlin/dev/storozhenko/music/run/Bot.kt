@@ -60,6 +60,7 @@ class Bot(
         logger.error("Caught exception: $exception")
         errorNotificationService?.sendErrorNotification(exception)
     }
+    private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
     private val virtualDispatcher = Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher()
     private val coroutine = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
     private val helpMessage = getResource("help_message.txt")
@@ -286,7 +287,107 @@ class Bot(
         }
     }
 
+    private fun commonYtDlpFlags(url: String): List<String> = buildList {
+        getIpVersionParam(url)?.let { add(it) }
+        addAll(getProxyParams(url))
+        addAll(listOf(
+            "--cookies", "/cookies.txt",
+            "-I", "0",
+            "--playlist-items", "1",
+            "--write-thumbnail",
+            "--embed-thumbnail",
+            "--convert-thumbnails", "jpg",
+            "--js-runtimes", "deno:/usr/bin/deno",
+            "--remote-components", "ejs:github",
+            "--retries", "5",
+            "--fragment-retries", "5",
+            "--socket-timeout", "30"
+        ))
+    }
+
+    private fun resolveSiblingThumbnail(mediaFile: File): File? {
+        val candidate = mediaFile.changeExtension("jpg")
+        if (!candidate.exists()) return null
+        val (isValid, msg) = validateThumbnailFile(candidate)
+        if (!isValid) {
+            logger.warn("Thumbnail validation failed: $msg. Continuing without thumbnail.")
+            return null
+        }
+        delayedDelete(candidate)
+        return candidate
+    }
+
+    private suspend fun sendAudioInPlace(
+        audioFile: File,
+        chatId: Long,
+        intermediateMessageId: Int,
+        caption: String,
+        artist: String,
+        title: String,
+        duration: Int? = null,
+        thumbnailFile: File? = null
+    ) {
+        val audioMedia = InputMediaAudio(audioFile, "audio").also {
+            it.caption = caption
+            it.parseMode = "HTML"
+            it.performer = artist
+            it.title = title
+            duration?.let { d -> it.duration = d }
+            thumbnailFile?.let { tf -> it.thumbnail = InputFile(tf) }
+        }
+        val edit = EditMessageMedia.builder()
+            .chatId(chatId.toString())
+            .messageId(intermediateMessageId)
+            .media(audioMedia)
+            .build()
+        telegramClient.executeAsync(edit).await()
+    }
+
+    private suspend fun downloadAndSendAudioOnly(url: String, message: String, intermediateMessageId: Int, chatId: Long, pulser: ChatActionPulser): Boolean {
+        var downloadedFile: File? = null
+        var thumbnailFile: File? = null
+        try {
+            pulser.set("typing")
+            editMessageText(chatId, intermediateMessageId, "$message\nDownloading audio...")
+            val downloadParams = commonYtDlpFlags(url) + listOf("-f", "bestaudio[ext=m4a]/bestaudio")
+            downloadedFile = download("${UUID.randomUUID()}.%(ext)s", url, *downloadParams.toTypedArray())
+                ?: run {
+                    editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download audio: empty result")
+                    return false
+                }
+
+            thumbnailFile = resolveSiblingThumbnail(downloadedFile)
+
+            val (artist, title) = message.lineSequence().first().split2ByDash(true)
+            editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
+            pulser.set("upload_voice")
+            sendAudioInPlace(
+                audioFile = downloadedFile,
+                chatId = chatId,
+                intermediateMessageId = intermediateMessageId,
+                caption = message.removeFirstLine(),
+                artist = artist,
+                title = title,
+                thumbnailFile = thumbnailFile
+            )
+            logger.info("Audio sent (audio-only fast path)")
+            return true
+        } catch (e: Exception) {
+            logger.error("Error in downloadAndSendAudioOnly: ${e.message}", e)
+            editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send audio: ${e.message}")
+            return false
+        } finally {
+            try {
+                downloadedFile?.let { if (it.exists()) { it.delete(); logger.info("Deleted audio file: ${it.absolutePath}") } }
+                thumbnailFile?.let { if (it.exists()) { it.delete(); logger.info("Deleted thumbnail: ${it.absolutePath}") } }
+            } catch (e: Exception) {
+                logger.error("Error cleaning up files: ${e.message}", e)
+            }
+        }
+    }
+
     private suspend fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, forceAudio: Boolean, pulser: ChatActionPulser): Boolean {
+        if (forceAudio) return downloadAndSendAudioOnly(url, message, intermediateMessageId, chatId, pulser)
         var downloadedFile: File? = null
         var thumbnailFile: File? = null
         var chunkFiles: List<File> = emptyList()
@@ -295,25 +396,10 @@ class Bot(
         try {
             pulser.set("typing")
             editMessageText(chatId, intermediateMessageId, "$message\nDownloading ${quality.label}... Use <code>low</code>/<code>medium</code>/<code>high</code> or <code>audio</code> after link to change.")
-            val ipVersionParam = getIpVersionParam(url)
-            val downloadParams = mutableListOf<String>().apply {
-                ipVersionParam?.let { add(it) }
-                addAll(getProxyParams(url))
-                addAll(listOf(
-                    "--cookies", "/cookies.txt",
-                    "-f", quality.formatSelector, "--merge-output-format", "mp4",
-                    "-I", "0",
-                    "--playlist-items", "1",
-                    "--write-thumbnail",
-                    "--embed-thumbnail",
-                    "--convert-thumbnails", "jpg",
-                    "--js-runtimes", "deno:/usr/bin/deno",
-                    "--remote-components", "ejs:github",
-                    "--retries", "5",
-                    "--fragment-retries", "5",
-                    "--socket-timeout", "30"
-                ))
-            }
+            val downloadParams = commonYtDlpFlags(url) + listOf(
+                "-f", quality.formatSelector,
+                "--merge-output-format", "mp4"
+            )
             downloadedFile = download(
                 "${UUID.randomUUID()}.%(ext)s",
                 url,
@@ -336,21 +422,7 @@ class Bot(
             val fileSizeInMB = fileSizeInBytes / (1024.0 * 1024.0)
             logger.info("Downloaded file size: ${String.format("%.2f", fileSizeInMB)} MB (${fileSizeInBytes} bytes)")
             
-            thumbnailFile = downloadedFile.changeExtension("jpg")
-            if (!thumbnailFile.exists()) {
-                logger.warn("Thumbnail file does not exist: ${thumbnailFile.absolutePath}")
-                // Create a placeholder thumbnail or continue without it
-                thumbnailFile = null
-            } else {
-                // Validate thumbnail file
-                val (isThumbnailValid, thumbnailValidationMessage) = validateThumbnailFile(thumbnailFile)
-                if (!isThumbnailValid) {
-                    logger.warn("Thumbnail validation failed: $thumbnailValidationMessage. Continuing without thumbnail.")
-                    thumbnailFile = null
-                } else {
-                    delayedDelete(thumbnailFile)
-                }
-            }
+            thumbnailFile = resolveSiblingThumbnail(downloadedFile)
             
             editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
             val dimensions = getVideoDimensions(downloadedFile)
@@ -385,39 +457,35 @@ class Bot(
                 chunkFiles = listOf(downloadedFile)
             }
             
-            // Decide audio vs video for music chats / forceAudio (non-music chats always get video)
-            if (idHasMusic || forceAudio) {
-                if (forceAudio) {
-                    logger.info("forceAudio set, skipping video analysis")
-                    sendVideo = false
+            // Music chats analyze the video to decide audio vs video; non-music chats always get video.
+            // forceAudio is handled in the audio-only fast path before we ever get here.
+            if (idHasMusic) {
+                pulser.set("typing")
+                editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
+                val windows: List<Pair<Double, Double>> = when {
+                    videoDuration <= 30 -> listOf(0.0 to videoDuration.toDouble())
+                    videoDuration > 60 -> {
+                        val start = 30.0
+                        val span = videoDuration - 30.0
+                        listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (start + span * it) to 5.0 }
+                    }
+                    else -> listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (videoDuration * it) to 5.0 }
+                }
+                logger.info("${downloadedFile.absolutePath} duration=${videoDuration}s, analysis windows=$windows")
+                val downloadedFileLocal = downloadedFile
+                val (totalSceneCount, totalFreezeDuration) = coroutineScope {
+                    val sceneJobs = windows.map { (s, d) -> async { getSceneChangeCount(downloadedFileLocal, s, d) } }
+                    val freezeJobs = windows.map { (s, d) -> async { getTotalFreezeDuration(downloadedFileLocal, s, d) } }
+                    sceneJobs.awaitAll().sum() to freezeJobs.awaitAll().sum()
+                }
+                sendVideo = if (totalSceneCount >= 2) {
+                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount >= 2, treating as moving")
+                    true
                 } else {
-                    pulser.set("typing")
-                    editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
-                    val windows: List<Pair<Double, Double>> = when {
-                        videoDuration <= 30 -> listOf(0.0 to videoDuration.toDouble())
-                        videoDuration > 60 -> {
-                            val start = 30.0
-                            val span = videoDuration - 30.0
-                            listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (start + span * it) to 5.0 }
-                        }
-                        else -> listOf(0.10, 0.30, 0.50, 0.70, 0.90).map { (videoDuration * it) to 5.0 }
-                    }
-                    logger.info("${downloadedFile.absolutePath} duration=${videoDuration}s, analysis windows=$windows")
-                    val downloadedFileLocal = downloadedFile
-                    val (totalSceneCount, totalFreezeDuration) = coroutineScope {
-                        val sceneJobs = windows.map { (s, d) -> async { getSceneChangeCount(downloadedFileLocal, s, d) } }
-                        val freezeJobs = windows.map { (s, d) -> async { getTotalFreezeDuration(downloadedFileLocal, s, d) } }
-                        sceneJobs.awaitAll().sum() to freezeJobs.awaitAll().sum()
-                    }
-                    sendVideo = if (totalSceneCount >= 2) {
-                        logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount >= 2, treating as moving")
-                        true
-                    } else {
-                        val totalAnalyzed = windows.sumOf { (_, d) -> d }
-                        val ratio = totalFreezeDuration / totalAnalyzed
-                        logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount, totalFreezeDuration / totalAnalyzed = $totalFreezeDuration / $totalAnalyzed = $ratio")
-                        ratio < 0.5
-                    }
+                    val totalAnalyzed = windows.sumOf { (_, d) -> d }
+                    val ratio = totalFreezeDuration / totalAnalyzed
+                    logger.info("${downloadedFile.absolutePath} totalSceneCount=$totalSceneCount, totalFreezeDuration / totalAnalyzed = $totalFreezeDuration / $totalAnalyzed = $ratio")
+                    ratio < 0.5
                 }
             }
 
@@ -441,22 +509,16 @@ class Bot(
                         return false
                     }
 
-                    val outerArtist = artist
-                    val outerTitle = title
-                    val audioMedia = InputMediaAudio(telegramAudioFile, "audio").also {
-                        it.caption = message.removeFirstLine()
-                        it.parseMode = "HTML"
-                        it.duration = videoDuration
-                        it.performer = outerArtist
-                        it.title = outerTitle
-                        thumbnailFile?.let { tf -> it.thumbnail = InputFile(tf) }
-                    }
-                    val edit = EditMessageMedia.builder()
-                        .chatId(chatId.toString())
-                        .messageId(intermediateMessageId)
-                        .media(audioMedia)
-                        .build()
-                    telegramClient.executeAsync(edit).await()
+                    sendAudioInPlace(
+                        audioFile = telegramAudioFile,
+                        chatId = chatId,
+                        intermediateMessageId = intermediateMessageId,
+                        caption = message.removeFirstLine(),
+                        artist = artist,
+                        title = title,
+                        duration = videoDuration,
+                        thumbnailFile = thumbnailFile
+                    )
                     logger.info("Audio sent (status morphed in place)")
                 } catch (e: TelegramApiException) {
                     logger.error("Failed to send audio: ${e.message}", e)
@@ -678,10 +740,13 @@ class Bot(
             logger.error("Can't download file for url $url")
             return@runInterruptible null
         }
-        var downloadedFile = files.first()
-        downloadedFile = downloadedFile.changeExtension("mp4")
-        delayedDelete(downloadedFile)
-        downloadedFile
+        val mediaFile = files.firstOrNull { it.extension.lowercase() !in IMAGE_EXTENSIONS }
+            ?: run {
+                logger.error("No media file found for url $url, only: ${files.map { it.name }}")
+                return@runInterruptible null
+            }
+        delayedDelete(mediaFile)
+        mediaFile
     }
 
     private fun extractFirstUrlByText(html: String, linkText: String): String? {
