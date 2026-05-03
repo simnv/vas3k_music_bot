@@ -52,6 +52,33 @@ class MediaProcessingService(
         chunkFiles.sortedBy { it.name }
     }
 
+    suspend fun convertToSquareThumbnail(inputFile: File): File = runInterruptible(virtualDispatcher) {
+        logger.info("Cropping thumbnail ${inputFile.absolutePath} to square...")
+        val outputFile = File(inputFile.parentFile, "${UUID.randomUUID()}_square_thumb.jpg")
+        val command = listOf(
+            "ffmpeg",
+            "-hide_banner", "-nostats", "-loglevel", "error",
+            "-i", inputFile.absolutePath,
+            "-vf", "crop='min(iw\\,ih)':'min(iw\\,ih)',scale=320:320",
+            "-q:v", "2",
+            outputFile.absolutePath
+        )
+        logger.info("Executing ffmpeg command: ${command.shellJoin()}")
+        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+            reader.lineSequence().forEach { line ->
+                if (line.isNotBlank()) logger.warn("ffmpeg: $line")
+            }
+        }
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            logger.error("ffmpeg square-thumbnail failed with exit code $exitCode")
+            throw RuntimeException("Failed to crop thumbnail to square")
+        }
+        scheduleDelete(outputFile)
+        outputFile
+    }
+
     suspend fun convertToTelegramAudio(inputFile: File): File = runInterruptible(virtualDispatcher) {
         logger.info("Extracting audio from ${inputFile.absolutePath} for Telegram...")
         val outputFile = File(inputFile.parentFile, "${UUID.randomUUID()}_telegram_audio.m4a")

@@ -3,6 +3,7 @@ package dev.storozhenko.music.run
 import dev.storozhenko.music.OdesilResponse
 import dev.storozhenko.music.Quality
 import dev.storozhenko.music.RequestOptions
+import dev.storozhenko.music.eagerlyDelete
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.parseRequestOptions
 import dev.storozhenko.music.removeFirstLine
@@ -133,8 +134,6 @@ class Bot(
             return
         }
 
-        val pulser = sender.startPulser(chatId, "typing")
-        try {
         val odesilDetections = urlEntities.mapNotNull(odesilService::detect)
         val links = odesilDetections.map { mapOdesilResponse(it.odesilResponse) }
         val validLinks = urlEntities.filter { entity -> urlValidator.isValidDownloadUrl(entity.text) }
@@ -144,6 +143,8 @@ class Bot(
             return
         }
 
+        val pulser = sender.startPulser(chatId, "typing")
+        try {
         lateinit var linksMessage: String
         if (!links.isEmpty()) {
             linksMessage = if (links.size == 1) {
@@ -178,7 +179,6 @@ class Bot(
         val requestMode = if (forceAudio) "audio (forced)" else quality.label
 
         logger.info("Sending message: $message")
-        // Send message with source info to error notification service
         val authorUsername = update.message.from?.userName
         val authorName = update.message.from?.let { listOfNotNull(it.firstName, it.lastName).joinToString(" ").ifBlank { null } }
         val chatTitle = update.message.chat.title ?: "Private Chat"
@@ -203,13 +203,9 @@ class Bot(
             val validurl = validLinks.first().text
             downloadAndSendVideo(validurl, message, tmId, replyToMessageId, chatId, quality, forceAudio, pulser)
         } else {
-            // No video to download, but we have Odesli information
-            // Keep the text message with Odesli information
             false
         }
 
-        // Status message is now consumed in-place via EditMessageMedia on success,
-        // and shows the error text on failure. No delete needed in either case.
         } finally {
             pulser.close()
         }
@@ -221,7 +217,10 @@ class Bot(
         try {
             pulser.set("typing")
             sender.editMessageText(chatId, intermediateMessageId, "$message\nDownloading audio...")
-            val downloadParams = downloader.commonYtDlpFlags(url) + listOf("-f", "bestaudio[ext=m4a]/bestaudio")
+            val downloadParams = downloader.commonYtDlpFlags(url) + listOf(
+                "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio",
+                "--print", "before_dl:[QUALITY] source: id=%(format_id)s codec=%(acodec)s abr=%(abr)skbps asr=%(asr)sHz ext=%(ext)s"
+            )
             downloadedFile = downloader.download("${UUID.randomUUID()}.%(ext)s", url, *downloadParams.toTypedArray())
                 ?: run {
                     sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to download audio: empty result")
@@ -229,6 +228,7 @@ class Bot(
                 }
 
             thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
+                ?.let { runCatching { processor.convertToSquareThumbnail(it) }.getOrNull() ?: it }
             val duration = probe.getMediaDuration(downloadedFile)
 
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
@@ -251,12 +251,7 @@ class Bot(
             sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send audio: ${e.message}")
             return false
         } finally {
-            try {
-                downloadedFile?.let { if (it.exists()) { it.delete(); logger.info("Deleted audio file: ${it.absolutePath}") } }
-                thumbnailFile?.let { if (it.exists()) { it.delete(); logger.info("Deleted thumbnail: ${it.absolutePath}") } }
-            } catch (e: Exception) {
-                logger.error("Error cleaning up files: ${e.message}", e)
-            }
+            eagerlyDelete(logger, downloadedFile, thumbnailFile)
         }
     }
 
@@ -283,15 +278,13 @@ class Bot(
                 return false
             }
             
-            // Validate downloaded file
             val (isVideoValid, videoValidationMessage) = validateVideoFile(downloadedFile)
             if (!isVideoValid) {
                 logger.error("Video validation failed: $videoValidationMessage")
                 sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Video validation failed: $videoValidationMessage")
                 return false
             }
-            
-            // Log file size
+
             val fileSizeInBytes = downloadedFile.length()
             val fileSizeInMB = fileSizeInBytes / (1024.0 * 1024.0)
             logger.info("Downloaded file size: ${String.format("%.2f", fileSizeInMB)} MB (${fileSizeInBytes} bytes)")
@@ -299,13 +292,7 @@ class Bot(
             thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
             
             sender.editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
-            val dimensions = probe.getVideoDimensions(downloadedFile)
-            logger.info("Video dimensions: $dimensions")
-            
-            val (videoWidth, videoHeight, videoDuration) = try {
-                dimensions.split(",").map { it.toDouble().toInt() }
-            } catch (e: Exception) {
-                logger.error("Failed to parse video dimensions: $dimensions", e)
+            val videoDuration = probe.getVideoDimensions(downloadedFile)?.duration ?: run {
                 sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions")
                 return false
             }
@@ -314,7 +301,6 @@ class Bot(
             var sendVideo = true
             val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
             
-            // Split video into chunks if it's larger than the configured chunk size
             if (fileSizeInMB > chunkSizeMB) {
                 sender.editMessageText(chatId, intermediateMessageId, "$message\nSplitting video into chunks...")
                 val outputPrefix = "${downloadedFile.parentFile.absolutePath}/${downloadedFile.nameWithoutExtension}_chunk.mp4"
@@ -331,25 +317,20 @@ class Bot(
                 chunkFiles = listOf(downloadedFile)
             }
             
-            // Music chats analyze the video to decide audio vs video; non-music chats always get video.
-            // forceAudio is handled in the audio-only fast path before we ever get here.
             if (idHasMusic) {
                 pulser.set("typing")
                 sender.editMessageText(chatId, intermediateMessageId, "$message\nAnalyzing Video...")
                 sendVideo = probe.decideSendAsVideo(downloadedFile, videoDuration)
             }
 
-            // Send audio if decision was audio (not video)
             if (!sendVideo) {
                 logger.info("Sending Audio...")
                 sender.editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
                 pulser.set("upload_voice")
 
                 try {
-                    // For audio, we'll use the original file (first chunk) but convert it to Telegram-compatible format
                     val sourceAudioFile = chunkFiles.first()
 
-                    // Extract audio for Telegram
                     sender.editMessageText(chatId, intermediateMessageId, "$message\nExtracting audio...")
                     try {
                         telegramAudioFile = processor.convertToTelegramAudio(sourceAudioFile)
@@ -359,6 +340,8 @@ class Bot(
                         return false
                     }
 
+                    val audioThumbnail = thumbnailFile
+                        ?.let { runCatching { processor.convertToSquareThumbnail(it) }.getOrNull() ?: it }
                     sender.sendAudioInPlace(
                         audioFile = telegramAudioFile,
                         chatId = chatId,
@@ -367,7 +350,7 @@ class Bot(
                         artist = artist,
                         title = title,
                         duration = videoDuration,
-                        thumbnailFile = thumbnailFile
+                        thumbnailFile = audioThumbnail
                     )
                     logger.info("Audio sent (status morphed in place)")
                 } catch (e: TelegramApiException) {
@@ -377,76 +360,15 @@ class Bot(
                 }
             }
 
-            // Send video chunks
             if (sendVideo) {
-                for ((index, chunkFile) in chunkFiles.withIndex()) {
-                    val chunkNumber = index + 1
-                    val totalChunks = chunkFiles.size
-                    
-                    // Update status message
-                    val statusMessage = if (totalChunks > 1) {
-                        "$message\nSending Video (Part $chunkNumber of $totalChunks)..."
-                    } else {
-                        "$message\nSending Video..."
-                    }
-                    
-                    sender.editMessageText(chatId, intermediateMessageId, statusMessage)
-                    logger.info("Sending Video chunk $chunkNumber of $totalChunks...")
-                    pulser.set("upload_video")
-                    
-                    try {
-                        // Get dimensions for this chunk
-                        val chunkDimensions = probe.getVideoDimensions(chunkFile)
-                        val (chunkWidth, chunkHeight, chunkDuration) = try {
-                            chunkDimensions.split(",").map { it.toDouble().toInt() }
-                        } catch (e: Exception) {
-                            logger.error("Failed to parse video dimensions for chunk: $chunkDimensions", e)
-                            sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions for chunk $chunkNumber")
-                            return false
-                        }
-                        
-                        // Create caption for this chunk
-                        val chunkCaption = if (totalChunks > 1) {
-                            "$message\n\nPart $chunkNumber of $totalChunks"
-                        } else {
-                            message
-                        }
-                        
-                        if (chunkNumber == 1) {
-                            sender.sendVideoInPlace(
-                                chatId = chatId,
-                                intermediateMessageId = intermediateMessageId,
-                                videoFile = chunkFile,
-                                width = chunkWidth,
-                                height = chunkHeight,
-                                duration = chunkDuration,
-                                caption = chunkCaption,
-                                thumbnailFile = thumbnailFile
-                            )
-                        } else {
-                            sender.sendVideoChunk(
-                                chatId = chatId,
-                                replyToMessageId = rmid,
-                                videoFile = chunkFile,
-                                width = chunkWidth,
-                                height = chunkHeight,
-                                duration = chunkDuration,
-                                caption = chunkCaption,
-                                thumbnailFile = thumbnailFile
-                            )
-                        }
-                        logger.info("Video chunk $chunkNumber sent successfully")
-
-                        // Add a small delay between sending chunks to avoid rate limiting
-                        if (chunkNumber < totalChunks) {
-                            delay(1000)
-                        }
-                    } catch (e: TelegramApiException) {
-                        logger.error("Failed to send video chunk $chunkNumber: ${e.message}", e)
-                        sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to send video chunk $chunkNumber: ${e.message}")
+                val probedChunks = chunkFiles.map { f ->
+                    val dims = probe.getVideoDimensions(f) ?: run {
+                        sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions for a chunk")
                         return false
                     }
+                    f to dims
                 }
+                if (!sender.sendVideoChunks(chatId, intermediateMessageId, rmid, probedChunks, message, thumbnailFile, pulser)) return false
             }
 
             return true
@@ -455,38 +377,8 @@ class Bot(
             sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to process video: ${e.message}")
             return false
         } finally {
-            // Clean up files in finally block to ensure they're always deleted
-            try {
-                // Delete chunk files (excluding the original downloaded file which will be deleted separately)
-                chunkFiles.forEach { chunkFile ->
-                    if (chunkFile.exists() && chunkFile != downloadedFile) {
-                        chunkFile.delete()
-                        logger.info("Deleted chunk file: ${chunkFile.absolutePath}")
-                    }
-                }
-                
-                downloadedFile?.let { file ->
-                    if (file.exists()) {
-                        file.delete()
-                        logger.info("Deleted downloaded file: ${file.absolutePath}")
-                    }
-                }
-                thumbnailFile?.let { file ->
-                    if (file.exists()) {
-                        file.delete()
-                        logger.info("Deleted thumbnail file: ${file.absolutePath}")
-                    }
-                }
-                // Clean up converted Telegram audio file if it exists and wasn't already handled by delayedDelete
-                telegramAudioFile?.let { file ->
-                    if (file.exists()) {
-                        file.delete()
-                        logger.info("Deleted converted Telegram audio file: ${file.absolutePath}")
-                    }
-                }
-            } catch (e: Exception) {
-                logger.error("Error cleaning up files: ${e.message}", e)
-            }
+            val files = (chunkFiles + listOfNotNull(downloadedFile, thumbnailFile, telegramAudioFile)).toTypedArray()
+            eagerlyDelete(logger, *files)
         }
     }
 

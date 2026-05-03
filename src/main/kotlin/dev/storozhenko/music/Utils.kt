@@ -107,3 +107,11 @@ fun CoroutineScope.delayedDelete(file: File, logger: Logger, onError: ((Throwabl
         }
     }
 }
+
+fun eagerlyDelete(logger: Logger, vararg files: File?) {
+    files.filterNotNull().distinct().forEach { file ->
+        runCatching {
+            if (file.exists() && file.delete()) logger.info("Deleted ${file.absolutePath}")
+        }.onFailure { logger.error("Failed to delete ${file.absolutePath}: ${it.message}", it) }
+    }
+}

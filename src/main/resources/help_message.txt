@@ -17,4 +17,4 @@
 
 Если ничего не указано, бот сам решает: статичную картинку отправит как аудио, динамичный клип — как видео.
 
-Порезано на основе https://github.com/AngryJKirk/vas3k_music_bot
+https://github.com/simnv/vas3k_music_bot

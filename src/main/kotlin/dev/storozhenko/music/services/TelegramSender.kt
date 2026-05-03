@@ -117,6 +117,41 @@ class TelegramSender(
         telegramClient.executeAsync(edit).await()
     }
 
+    suspend fun sendVideoChunks(
+        chatId: Long,
+        intermediateMessageId: Int,
+        replyToMessageId: Int,
+        chunks: List<Pair<File, VideoDimensions>>,
+        baseMessage: String,
+        thumbnailFile: File?,
+        pulser: ChatActionPulser
+    ): Boolean {
+        val total = chunks.size
+        chunks.forEachIndexed { index, (file, dims) ->
+            val number = index + 1
+            val statusMessage = if (total > 1) "$baseMessage\nSending Video (Part $number of $total)..."
+                                else "$baseMessage\nSending Video..."
+            editMessageText(chatId, intermediateMessageId, statusMessage)
+            logger.info("Sending Video chunk $number of $total...")
+            pulser.set("upload_video")
+            val caption = if (total > 1) "$baseMessage\n\nPart $number of $total" else baseMessage
+            try {
+                if (number == 1) {
+                    sendVideoInPlace(chatId, intermediateMessageId, file, dims.width, dims.height, dims.duration, caption, thumbnailFile)
+                } else {
+                    sendVideoChunk(chatId, replyToMessageId, file, dims.width, dims.height, dims.duration, caption, thumbnailFile)
+                }
+                logger.info("Video chunk $number sent successfully")
+                if (number < total) delay(1000)
+            } catch (e: TelegramApiException) {
+                logger.error("Failed to send video chunk $number: ${e.message}", e)
+                editMessageText(chatId, intermediateMessageId, "$baseMessage\n❌ Failed to send video chunk $number: ${e.message}")
+                return false
+            }
+        }
+        return true
+    }
+
     suspend fun sendVideoChunk(
         chatId: Long,
         replyToMessageId: Int,

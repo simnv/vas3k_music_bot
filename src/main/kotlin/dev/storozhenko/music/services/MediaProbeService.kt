@@ -11,6 +11,8 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
 
+data class VideoDimensions(val width: Int, val height: Int, val duration: Int)
+
 class MediaProbeService(private val virtualDispatcher: CoroutineDispatcher) {
     private val logger = getLogger()
 
@@ -32,7 +34,7 @@ class MediaProbeService(private val virtualDispatcher: CoroutineDispatcher) {
         }
     }
 
-    suspend fun getVideoDimensions(videoFile: File): String = runInterruptible(virtualDispatcher) {
+    suspend fun getVideoDimensions(videoFile: File): VideoDimensions? = runInterruptible(virtualDispatcher) {
         logger.info("Running ffprobe for $videoFile...")
         val command = listOf(
             "ffprobe", "-v", "error",
@@ -45,7 +47,14 @@ class MediaProbeService(private val virtualDispatcher: CoroutineDispatcher) {
         val lines = BufferedReader(InputStreamReader(process.inputStream)).readLines()
         logger.info("Got ${lines.size} lines from ffprobe: $lines")
         process.waitFor()
-        if (lines.size >= 2) "${lines[0]},${lines[1]}" else lines.firstOrNull() ?: ""
+        val raw = if (lines.size >= 2) "${lines[0]},${lines[1]}" else lines.firstOrNull() ?: ""
+        runCatching {
+            val parts = raw.split(",").map { it.toDouble().toInt() }
+            VideoDimensions(parts[0], parts[1], parts[2])
+        }.getOrElse {
+            logger.error("Failed to parse video dimensions: $raw", it)
+            null
+        }
     }
 
     suspend fun getTotalFreezeDuration(videoFile: File, startTime: Double, duration: Double): Double = runInterruptible(virtualDispatcher) {
