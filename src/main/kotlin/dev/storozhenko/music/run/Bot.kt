@@ -357,6 +357,7 @@ class Bot(
                 }
 
             thumbnailFile = resolveSiblingThumbnail(downloadedFile)
+            val duration = getMediaDuration(downloadedFile)
 
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
             editMessageText(chatId, intermediateMessageId, "$message\nSending Audio...")
@@ -368,6 +369,7 @@ class Bot(
                 caption = message.removeFirstLine(),
                 artist = artist,
                 title = title,
+                duration = duration,
                 thumbnailFile = thumbnailFile
             )
             logger.info("Audio sent (audio-only fast path)")
@@ -758,6 +760,24 @@ class Bot(
     private fun File.changeExtension(newExtension: String): File {
         val newName = "${this.nameWithoutExtension}.$newExtension"
         return this.resolveSibling(newName)
+    }
+
+    private suspend fun getMediaDuration(file: File): Int? = runInterruptible(virtualDispatcher) {
+        val command = listOf(
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0",
+            file.absolutePath
+        )
+        try {
+            val process = ProcessBuilder(command).redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().readText().trim()
+            process.waitFor()
+            output.toDoubleOrNull()?.toInt()
+        } catch (e: Exception) {
+            logger.warn("ffprobe duration failed for ${file.absolutePath}: ${e.message}")
+            null
+        }
     }
 
     private suspend fun getVideoDimensions(videoFile: File): String = runInterruptible(virtualDispatcher) {
