@@ -1,9 +1,19 @@
 package dev.storozhenko.music.run
 
 import dev.storozhenko.music.OdesilResponse
+import dev.storozhenko.music.Quality
+import dev.storozhenko.music.RequestOptions
+import dev.storozhenko.music.changeExtension
+import dev.storozhenko.music.delayedDelete
 import dev.storozhenko.music.getLogger
+import dev.storozhenko.music.parseRequestOptions
+import dev.storozhenko.music.removeFirstLine
 import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.OdesilService
+import dev.storozhenko.music.shellJoin
+import dev.storozhenko.music.split2ByDash
+import dev.storozhenko.music.validateThumbnailFile
+import dev.storozhenko.music.validateVideoFile
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,7 +29,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import java.io.Closeable
-import kotlin.time.Duration.Companion.minutes
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
 import org.telegram.telegrambots.meta.api.methods.send.SendChatAction
@@ -94,42 +103,6 @@ class Bot(
         } else {
             emptyList()
         }
-    }
-
-    private enum class Quality(val label: String, val formatSelector: String) {
-        LOW("≤480p", "bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[ext=mp4]/best"),
-        MEDIUM("≤720p", "bestvideo[height<=720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best"),
-        HIGH("best", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best")
-    }
-
-    private data class RequestOptions(val quality: Quality, val forceAudio: Boolean)
-
-    private fun parseRequestOptions(text: String): RequestOptions {
-        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        if (tokens.isEmpty()) return RequestOptions(Quality.MEDIUM, false)
-        val lastIdx = tokens.size - 1
-        var quality: Quality? = null
-        var forceAudio = false
-        tokens.forEachIndexed { i, raw ->
-            val tok = raw.lowercase()
-            val atBoundary = i == 0 || i == lastIdx
-            if (quality == null) {
-                quality = when {
-                    tok == "low" -> Quality.LOW
-                    tok == "medium" || tok == "med" || tok == "mid" -> Quality.MEDIUM
-                    tok == "high" || tok == "hi" -> Quality.HIGH
-                    atBoundary && tok == "l" -> Quality.LOW
-                    atBoundary && tok == "m" -> Quality.MEDIUM
-                    atBoundary && tok == "h" -> Quality.HIGH
-                    else -> null
-                }
-            }
-            if (!forceAudio) {
-                forceAudio = tok == "audio" || tok == "au" || tok == "sound" || tok == "snd" ||
-                    (atBoundary && (tok == "a" || tok == "s"))
-            }
-        }
-        return RequestOptions(quality ?: Quality.MEDIUM, forceAudio)
     }
 
     private inner class ChatActionPulser(private val chatId: Long, initialAction: String) : Closeable {
@@ -709,16 +682,8 @@ class Bot(
     }
 
     private fun delayedDelete(fileToDelete: File) {
-        fileToDelete.deleteOnExit()
-        fileDeleteScope.launch {
-            runCatching {
-                delay(55.minutes)
-                fileToDelete.delete()
-                logger.info("${fileToDelete.absolutePath} is deleted")
-            }.onFailure {
-                logger.error("Could not delete ${fileToDelete.absolutePath}")
-                errorNotificationService?.sendErrorNotification(it, "File Deletion: ${fileToDelete.absolutePath}")
-            }
+        fileDeleteScope.delayedDelete(fileToDelete, logger) { e ->
+            errorNotificationService?.sendErrorNotification(e, "File Deletion: ${fileToDelete.absolutePath}")
         }
     }
 
@@ -755,11 +720,6 @@ class Bot(
         val doc = Jsoup.parse(html)
         val element = doc.select("a:containsOwn($linkText)").first()
         return element?.attr("href")
-    }
-
-    private fun File.changeExtension(newExtension: String): File {
-        val newName = "${this.nameWithoutExtension}.$newExtension"
-        return this.resolveSibling(newName)
     }
 
     private suspend fun getMediaDuration(file: File): Int? = runInterruptible(virtualDispatcher) {
@@ -1148,87 +1108,4 @@ class Bot(
             logger.info("Failed to edit message: ${e.message}")
         }
     }
-}
-
-private fun String.shellQuote(): String {
-    if (this.isEmpty()) return "''"
-    if (this.all { it.isLetterOrDigit() || it in "_./@:=+-,%" }) return this
-    return "'" + this.replace("'", "'\\''") + "'"
-}
-
-private fun List<String>.shellJoin(): String = joinToString(" ") { it.shellQuote() }
-
-fun String.split2ByDash(reverseIfSingle: Boolean = false): Pair<String, String> {
-    val parts = this.split(" - ", limit = 2)
-    return when {
-        parts.size == 2 -> parts[0] to parts[1]
-        reverseIfSingle -> "" to parts[0]
-        else -> parts[0] to ""
-    }
-}
-
-fun String.removeFirstLine(): String {
-    return this.lineSequence().drop(1).joinToString("\n")
-}
-
-/**
- * Validates if a video file is compatible with Telegram's requirements
- * @param videoFile The video file to validate
- * @return Pair of Boolean (isValid) and String (errorMessage)
- */
-private fun validateVideoFile(videoFile: File): Pair<Boolean, String> {
-    if (!videoFile.exists() || !videoFile.isFile) {
-        return false to "File does not exist or is not a regular file"
-    }
-    
-    if (videoFile.length() == 0L) {
-        return false to "File is empty"
-    }
-    
-    // // Check file size (Telegram has a 2000MB limit for regular uploads)
-    // val fileSizeInBytes = videoFile.length()
-    // if (fileSizeInBytes > 2000 * 1024 * 1024) {
-    //     return false to "File size exceeds Telegram's 2000MB limit (${fileSizeInBytes / (1024.0 * 1024.0)} MB)"
-    // }
-    
-    // Check file extension
-    val fileName = videoFile.name.lowercase()
-    if (!fileName.endsWith(".mp4") && !fileName.endsWith(".mov") && !fileName.endsWith(".avi")) {
-        return false to "Unsupported file format: ${videoFile.extension}. Telegram supports MP4, MOV, and AVI"
-    }
-    
-    return true to "File is valid"
-}
-
-/**
- * Validates if a thumbnail file is compatible with Telegram's requirements
- * @param thumbnailFile The thumbnail file to validate
- * @return Pair of Boolean (isValid) and String (errorMessage)
- */
-private fun validateThumbnailFile(thumbnailFile: File?): Pair<Boolean, String> {
-    if (thumbnailFile == null) {
-        return true to "No thumbnail provided (optional)"
-    }
-    
-    if (!thumbnailFile.exists() || !thumbnailFile.isFile) {
-        return false to "Thumbnail file does not exist or is not a regular file"
-    }
-    
-    if (thumbnailFile.length() == 0L) {
-        return false to "Thumbnail file is empty"
-    }
-    
-    // Check thumbnail size (Telegram recommends thumbnails under 200KB)
-    val thumbnailSizeInBytes = thumbnailFile.length()
-    if (thumbnailSizeInBytes > 200 * 1024) {
-        return false to "Thumbnail size exceeds recommended 200KB limit (${thumbnailSizeInBytes / 1024.0} KB)"
-    }
-    
-    // Check thumbnail format
-    val fileName = thumbnailFile.name.lowercase()
-    if (!fileName.endsWith(".jpg") && !fileName.endsWith(".jpeg") && !fileName.endsWith(".png")) {
-        return false to "Unsupported thumbnail format: ${thumbnailFile.extension}. Telegram supports JPG and PNG"
-    }
-    
-    return true to "Thumbnail is valid"
 }
