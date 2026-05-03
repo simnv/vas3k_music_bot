@@ -10,6 +10,7 @@ import dev.storozhenko.music.parseRequestOptions
 import dev.storozhenko.music.removeFirstLine
 import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.OdesilService
+import dev.storozhenko.music.services.UrlValidator
 import dev.storozhenko.music.shellJoin
 import dev.storozhenko.music.split2ByDash
 import dev.storozhenko.music.validateThumbnailFile
@@ -49,7 +50,6 @@ import java.util.concurrent.Executors
 import org.jsoup.Jsoup
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.net.URL
 
 class Bot(
     private val botName: String,
@@ -65,6 +65,7 @@ class Bot(
     private val logger = getLogger()
     private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
     private val odesilService = OdesilService()
+    private val urlValidator = UrlValidator()
     val handler = CoroutineExceptionHandler { _, exception ->
         logger.error("Caught exception: $exception")
         errorNotificationService?.sendErrorNotification(exception)
@@ -182,7 +183,7 @@ class Bot(
         try {
         val odesilDetections = urlEntities.mapNotNull(odesilService::detect)
         val links = odesilDetections.map { mapOdesilResponse(it.odesilResponse) }
-        val validLinks = urlEntities.filter { entity -> isValidDownloadUrl(entity.text) }
+        val validLinks = urlEntities.filter { entity -> urlValidator.isValidDownloadUrl(entity.text) }
 
         if (links.isEmpty() && validLinks.isEmpty()) {
             logger.info("No links from Odesil or valid video services, returning")
@@ -906,93 +907,6 @@ class Bot(
             " [%02d:%02d]".format(minutes, remainingSeconds)
         }
     }
-
-    data class DomainConfig(
-        val hosts: Set<String>, // exact host names
-        val allowedPaths: Set<String>, // path must start with one of these
-        val blockedPathPrefixes: Set<String> = emptySet(),
-        val extraPathTokens: Set<String> = emptySet()
-    )
-
-    private val VALID_URL_CONFIG = mapOf(
-        "youtube" to DomainConfig(
-            hosts = setOf("youtube.com", "youtu.be"),
-            allowedPaths = setOf("/watch", "/shorts/", "/embed/", "/v/", "/"),
-            blockedPathPrefixes = setOf("/post/")
-        ),
-
-        "tiktok" to DomainConfig(
-            hosts = setOf("tiktok.com", "vt.tiktok.com"),
-            allowedPaths = setOf("/"),
-            blockedPathPrefixes = emptySet()
-        ),
-
-        "vk" to DomainConfig(
-            hosts = setOf("vk.com", "vk.ru", "vkvideo.ru"),
-            allowedPaths = setOf("/video", "/clip"),
-            blockedPathPrefixes = emptySet(),
-            extraPathTokens = setOf("/video-", "/clip-")
-        ),
-
-        "rutube" to DomainConfig(
-            hosts = setOf("rutube.ru"),
-            allowedPaths = setOf("/video"),
-            blockedPathPrefixes = emptySet()
-        )
-    )
-
-    private fun isValidDownloadUrl(urlString: String): Boolean =
-        runCatching {
-            logger.info("Validating URL: $urlString")
-            val url = URL(urlString)
-            val host = url.host.lowercase()
-            val path = url.path.lowercase()
-            logger.info("Parsed URL - host: $host, path: $path")
-
-            // Find the first config whose host matches (exact or sub-domain)
-            val cfg = VALID_URL_CONFIG.values.firstOrNull { cfg ->
-                val hostMatches = cfg.hosts.any { exact ->
-                    val matches = host == exact || host.endsWith(".$exact")
-                    if (matches) {
-                        logger.info("Host '$host' matches config for '$exact'")
-                    }
-                    matches
-                }
-                hostMatches
-            } ?: run {
-                logger.info("No config found for host: $host")
-                return false
-            }
-
-            logger.info("Using config with hosts: ${cfg.hosts}, allowedPaths: ${cfg.allowedPaths}, blockedPathPrefixes: ${cfg.blockedPathPrefixes}, extraPathTokens: ${cfg.extraPathTokens}")
-
-            // 1. Reject blocked prefixes
-            val blockedPrefix = cfg.blockedPathPrefixes.find { path.startsWith(it) }
-            if (blockedPrefix != null) {
-                logger.info("URL rejected: path '$path' starts with blocked prefix '$blockedPrefix'")
-                return false
-            }
-
-            // 2. Accept explicit allowed prefixes
-            val allowedPrefix = cfg.allowedPaths.find { path.startsWith(it) }
-            if (allowedPrefix != null) {
-                logger.info("URL accepted: path '$path' starts with allowed prefix '$allowedPrefix'")
-                return true
-            }
-
-            // 3. Accept extra in-path tokens (VK-style "/video-123", etc.)
-            val extraToken = cfg.extraPathTokens.find { path.contains(it) }
-            if (extraToken != null) {
-                logger.info("URL accepted: path '$path' contains extra token '$extraToken'")
-                return true
-            }
-
-            logger.info("URL rejected: path '$path' doesn't match any allowed patterns")
-            false
-        }.getOrElse { exception ->
-            logger.error("Error validating URL '$urlString': ${exception.message}", exception)
-            false
-        }
 
     /**
      * Splits a video file into chunks using mkvmerge
