@@ -42,6 +42,15 @@ class DownloadService(
         return if (list.any { url.contains(it, ignoreCase = true) }) listOf("--proxy", ytdlProxy) else emptyList()
     }
 
+    fun videoFlags(url: String, formatSelector: String): List<String> =
+        commonYtDlpFlags(url) + listOf("-f", formatSelector, "--merge-output-format", "mp4")
+
+    fun audioFlags(url: String): List<String> =
+        commonYtDlpFlags(url) + listOf(
+            "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio",
+            "--print", "before_dl:[QUALITY] source: id=%(format_id)s codec=%(acodec)s abr=%(abr)skbps asr=%(asr)sHz ext=%(ext)s"
+        )
+
     fun commonYtDlpFlags(url: String): List<String> = buildList {
         getIpVersionParam(url)?.let { add(it) }
         addAll(getProxyParams(url))

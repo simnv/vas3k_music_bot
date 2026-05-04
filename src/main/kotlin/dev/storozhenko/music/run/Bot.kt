@@ -21,8 +21,10 @@ import dev.storozhenko.music.validateVideoFile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -179,20 +181,45 @@ class Bot(
             return
         }
 
+        val validLinks = urlEntities.filter { entity -> urlValidator.isValidDownloadUrl(entity.text) }
+        val (quality, forceAudio) = parseRequestOptions(update.message.text)
+        val prefetchUrl = validLinks.firstOrNull()?.text
+        val prefetchedDownload: Deferred<File?>? = prefetchUrl?.let { url ->
+            val flags = if (forceAudio) downloader.audioFlags(url) else downloader.videoFlags(url, quality.formatSelector)
+            coroutine.async { downloader.download("${UUID.randomUUID()}.%(ext)s", url, *flags.toTypedArray()) }
+        }
+
+        val pulser = sender.startPulser(chatId, "typing")
+        val cancelToken = UUID.randomUUID().toString()
+        activeJobs[cancelToken] = requireNotNull(currentCoroutineContext()[Job]) { "no Job in coroutine context" }
+        val cancelKb = cancelKeyboard(cancelToken)
+        val replyToMessageId = update.message.getMessageId()
+        var tmId: Int? = null
+        try {
+        // Send a "Downloading..." placeholder right away when we have a downloadable URL,
+        // BEFORE Odesli detect, so the user sees feedback within ~0.5s instead of ~1-22s.
+        if (validLinks.isNotEmpty()) {
+            val placeholder = SendMessage.builder()
+                .chatId(chatId.toString())
+                .text("Downloading...")
+                .parseMode("HTML")
+                .replyToMessageId(replyToMessageId)
+                .linkPreviewOptions(LinkPreviewOptions.builder().isDisabled(true).build())
+                .disableNotification(true)
+                .replyMarkup(cancelKb)
+                .build()
+            tmId = telegramClient.executeAsync(placeholder).await().messageId
+        }
+
+        // Now run Odesli enrichment in parallel with the prefetch download (and the visible placeholder).
         val odesilDetections = urlEntities.mapNotNull { odesilService.detect(it) }
         val links = odesilDetections.map { mapOdesilResponse(it.odesilResponse) }
-        val validLinks = urlEntities.filter { entity -> urlValidator.isValidDownloadUrl(entity.text) }
 
         if (links.isEmpty() && validLinks.isEmpty()) {
             logger.info("No links from Odesil or valid video services, returning")
             return
         }
 
-        val pulser = sender.startPulser(chatId, "typing")
-        val cancelToken = UUID.randomUUID().toString()
-        activeJobs[cancelToken] = requireNotNull(currentCoroutineContext()[Job]) { "no Job in coroutine context" }
-        var tmId: Int? = null
-        try {
         lateinit var linksMessage: String
         if (!links.isEmpty()) {
             linksMessage = if (links.size == 1) {
@@ -204,6 +231,15 @@ class Bot(
             val validLink = validLinks.first()
             val meta = downloader.getVideoMeta(validLink.text)
             val displayTitle = formatTitleWithDuration(meta)
+            val partial = "$displayTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+
+            // Early flush: show title + source link as soon as getVideoMeta returns, BEFORE the
+            // ~17s ytSearch + Odesli chain runs. Without this the user stares at "Downloading…"
+            // until the whole metadata pipeline finishes.
+            tmId?.let { id ->
+                runCatching { sender.editMessageText(chatId, id, "$partial\nDownloading...", cancelKb) }
+            }
+
             val isMusicChat = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
             val odesilFromTitle = if (isMusicChat && isVkOrRutube(validLink.text) && meta.title.isNotBlank()) {
                 val searchQuery = stripAnnotations(meta.title)
@@ -215,7 +251,7 @@ class Bot(
             linksMessage = if (odesilFromTitle != null) {
                 mapOdesilResponse(odesilFromTitle) + "\n<a href=\"${validLink.text}\">${validLink.text}</a>"
             } else {
-                "$displayTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+                partial
             }
         }
 
@@ -236,7 +272,6 @@ class Bot(
 
         val message = "$linksMessage"
 
-        val (quality, forceAudio) = parseRequestOptions(update.message.text)
         val requestMode = if (forceAudio) "audio (forced)" else quality.label
 
         logger.info("Sending message: $message")
@@ -245,32 +280,35 @@ class Bot(
         val chatTitle = update.message.chat.title ?: "Private Chat"
         errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle, requestMode)
 
-        val replyToMessageId = update.message.getMessageId()
-        val cancelKb = cancelKeyboard(cancelToken)
-        val sendMessage = SendMessage.builder()
-            .chatId(chatId.toString())
-            .text(message)
-            .parseMode("HTML")
-            .replyToMessageId(replyToMessageId)
-            .linkPreviewOptions(LinkPreviewOptions.builder().isDisabled(true).build())
-            .disableNotification(true)
-            .replyMarkup(cancelKb)
-            .build()
-        val textMessage = telegramClient.executeAsync(sendMessage).await()
-        val mid = textMessage.messageId
-        tmId = mid
+        val mid: Int = tmId?.also {
+            sender.editMessageText(chatId, it, "$message\nDownloading...", cancelKb)
+        } ?: run {
+            val sendMessage = SendMessage.builder()
+                .chatId(chatId.toString())
+                .text(message)
+                .parseMode("HTML")
+                .replyToMessageId(replyToMessageId)
+                .linkPreviewOptions(LinkPreviewOptions.builder().isDisabled(true).build())
+                .disableNotification(true)
+                .replyMarkup(cancelKb)
+                .build()
+            val newId = telegramClient.executeAsync(sendMessage).await().messageId
+            tmId = newId
+            newId
+        }
 
-        val yturl = youtubeFromMessage ?: ytSearchUrl
-        val success = if (yturl != null) {
-            downloadAndSendVideo(yturl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser, cancelKb)
-        } else if (!validLinks.isEmpty()) {
-            val validurl = validLinks.first().text
-            downloadAndSendVideo(validurl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser, cancelKb)
+        // Prefer the user's posted URL (validLinks[0]) over an Odesli-derived YouTube URL, so the
+        // prefetched download is reused instead of being thrown away in favor of a YT redownload.
+        val downloadUrl = validLinks.firstOrNull()?.text ?: youtubeFromMessage ?: ytSearchUrl
+        val success = if (downloadUrl != null) {
+            downloadAndSendVideo(downloadUrl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser, cancelKb, prefetchUrl, prefetchedDownload)
         } else {
             false
         }
 
         } catch (e: CancellationException) {
+            // Kill yt-dlp first so it stops chewing CPU/network while we issue the Telegram delete.
+            prefetchedDownload?.cancel()
             tmId?.let { id ->
                 withContext(NonCancellable) {
                     runCatching { sender.deleteMessage(chatId, id) }
@@ -279,12 +317,13 @@ class Bot(
             errorNotificationService?.sendErrorNotification(e, "Cancelled by user")
             throw e
         } finally {
+            prefetchedDownload?.cancel()
             activeJobs.remove(cancelToken)
             pulser.close()
         }
     }
 
-    private suspend fun downloadAndSendAudioOnly(url: String, message: String, intermediateMessageId: Int, chatId: Long, pulser: TelegramSender.ChatActionPulser, cancelKb: InlineKeyboardMarkup? = null): Boolean {
+    private suspend fun downloadAndSendAudioOnly(url: String, message: String, intermediateMessageId: Int, chatId: Long, pulser: TelegramSender.ChatActionPulser, cancelKb: InlineKeyboardMarkup? = null, prefetchedUrl: String? = null, prefetchedDownload: Deferred<File?>? = null): Boolean {
         suspend fun status(suffix: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n$suffix", cancelKb)
         suspend fun fail(reason: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ $reason", emptyKeyboard)
         var downloadedFile: File? = null
@@ -292,11 +331,7 @@ class Bot(
         try {
             pulser.set("typing")
             status("Downloading audio...")
-            val downloadParams = downloader.commonYtDlpFlags(url) + listOf(
-                "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio",
-                "--print", "before_dl:[QUALITY] source: id=%(format_id)s codec=%(acodec)s abr=%(abr)skbps asr=%(asr)sHz ext=%(ext)s"
-            )
-            downloadedFile = downloader.download("${UUID.randomUUID()}.%(ext)s", url, *downloadParams.toTypedArray())
+            downloadedFile = awaitOrDownload(prefetchedUrl, prefetchedDownload, url, downloader.audioFlags(url))
                 ?: run { fail("Failed to download audio: empty result"); return false }
 
             thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
@@ -316,7 +351,6 @@ class Bot(
                 duration = duration,
                 thumbnailFile = thumbnailFile
             )
-            sender.removeKeyboard(chatId, intermediateMessageId)
             logger.info("Audio sent (audio-only fast path)")
             return true
         } catch (e: Exception) {
@@ -328,8 +362,8 @@ class Bot(
         }
     }
 
-    private suspend fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, forceAudio: Boolean, pulser: TelegramSender.ChatActionPulser, cancelKb: InlineKeyboardMarkup? = null): Boolean {
-        if (forceAudio) return downloadAndSendAudioOnly(url, message, intermediateMessageId, chatId, pulser, cancelKb)
+    private suspend fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, forceAudio: Boolean, pulser: TelegramSender.ChatActionPulser, cancelKb: InlineKeyboardMarkup? = null, prefetchedUrl: String? = null, prefetchedDownload: Deferred<File?>? = null): Boolean {
+        if (forceAudio) return downloadAndSendAudioOnly(url, message, intermediateMessageId, chatId, pulser, cancelKb, prefetchedUrl, prefetchedDownload)
         suspend fun status(suffix: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n$suffix", cancelKb)
         suspend fun fail(reason: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ $reason", emptyKeyboard)
         var downloadedFile: File? = null
@@ -341,15 +375,8 @@ class Bot(
             pulser.set("typing")
             val downloadingMsg = if (quality == Quality.HIGH) "Downloading..." else "Downloading <code>${quality.label}</code>..."
             status("$downloadingMsg Use <code>low</code>/<code>medium</code>/<code>high</code> or <code>audio</code> after link to change quality.")
-            val downloadParams = downloader.commonYtDlpFlags(url) + listOf(
-                "-f", quality.formatSelector,
-                "--merge-output-format", "mp4"
-            )
-            downloadedFile = downloader.download(
-                "${UUID.randomUUID()}.%(ext)s",
-                url,
-                *downloadParams.toTypedArray()
-            ) ?: run { fail("Failed to download file: empty result"); return false }
+            downloadedFile = awaitOrDownload(prefetchedUrl, prefetchedDownload, url, downloader.videoFlags(url, quality.formatSelector))
+                ?: run { fail("Failed to download file: empty result"); return false }
 
             val (isVideoValid, videoValidationMessage) = validateVideoFile(downloadedFile)
             if (!isVideoValid) {
@@ -425,7 +452,6 @@ class Bot(
                         duration = videoDuration,
                         thumbnailFile = audioThumbnail
                     )
-                    sender.removeKeyboard(chatId, intermediateMessageId)
                     logger.info("Audio sent (status morphed in place)")
                 } catch (e: TelegramApiException) {
                     logger.error("Failed to send audio: ${e.message}", e)
@@ -446,7 +472,6 @@ class Bot(
                     f to dims
                 }
                 if (!sender.sendVideoChunks(chatId, intermediateMessageId, rmid, probedChunks, message, thumbnailFile, pulser, cancelKb)) return false
-                sender.removeKeyboard(chatId, intermediateMessageId)
             }
 
             return true
@@ -523,6 +548,16 @@ class Bot(
             .replace(Regex("\\s*\\([^)]*\\)"), "")
             .trim()
             .replace(Regex("\\s+"), " ")
+
+    private suspend fun awaitOrDownload(prefetchedUrl: String?, prefetchedDownload: Deferred<File?>?, url: String, flags: List<String>): File? {
+        if (prefetchedDownload != null && prefetchedUrl == url) return prefetchedDownload.await()
+        // URL mismatch — cancel; if it had already completed, recover the orphan file and delete it.
+        prefetchedDownload?.let { deferred ->
+            deferred.cancel()
+            runCatching { deferred.await() }.getOrNull()?.delete()
+        }
+        return downloader.download("${UUID.randomUUID()}.%(ext)s", url, *flags.toTypedArray())
+    }
 
     private fun cancelKeyboard(token: String): InlineKeyboardMarkup {
         val button = InlineKeyboardButton.builder()
