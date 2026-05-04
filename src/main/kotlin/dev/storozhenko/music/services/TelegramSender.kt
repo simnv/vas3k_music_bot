@@ -9,12 +9,15 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.telegram.telegrambots.meta.api.methods.send.SendChatAction
 import org.telegram.telegrambots.meta.api.methods.send.SendVideo
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageMedia
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageReplyMarkup
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText
 import org.telegram.telegrambots.meta.api.objects.InputFile
 import org.telegram.telegrambots.meta.api.objects.LinkPreviewOptions
 import org.telegram.telegrambots.meta.api.objects.media.InputMediaAudio
 import org.telegram.telegrambots.meta.api.objects.media.InputMediaVideo
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import org.telegram.telegrambots.meta.generics.TelegramClient
 import java.io.Closeable
@@ -45,16 +48,39 @@ class TelegramSender(
         override fun close() { job.cancel() }
     }
 
-    suspend fun editMessageText(chatId: Long, messageId: Int, newText: String) {
-        val editMessage = EditMessageText.builder()
+    suspend fun deleteMessage(chatId: Long, messageId: Int) {
+        try {
+            telegramClient.executeAsync(
+                DeleteMessage.builder().chatId(chatId.toString()).messageId(messageId).build()
+            ).await()
+        } catch (e: TelegramApiException) {
+            logger.info("Failed to delete message: ${e.message}")
+        }
+    }
+
+    suspend fun removeKeyboard(chatId: Long, messageId: Int) {
+        val edit = EditMessageReplyMarkup.builder()
+            .chatId(chatId.toString())
+            .messageId(messageId)
+            .replyMarkup(InlineKeyboardMarkup.builder().build())
+            .build()
+        try {
+            telegramClient.executeAsync(edit).await()
+        } catch (e: TelegramApiException) {
+            logger.info("Failed to remove keyboard: ${e.message}")
+        }
+    }
+
+    suspend fun editMessageText(chatId: Long, messageId: Int, newText: String, replyMarkup: InlineKeyboardMarkup? = null) {
+        val builder = EditMessageText.builder()
             .chatId(chatId.toString())
             .messageId(messageId)
             .text(newText)
             .parseMode("HTML")
             .linkPreviewOptions(LinkPreviewOptions.builder().isDisabled(true).build())
-            .build()
+        replyMarkup?.let { builder.replyMarkup(it) }
         try {
-            telegramClient.executeAsync(editMessage).await()
+            telegramClient.executeAsync(builder.build()).await()
         } catch (e: TelegramApiException) {
             logger.info("Failed to edit message: ${e.message}")
         }
@@ -124,14 +150,15 @@ class TelegramSender(
         chunks: List<Pair<File, VideoDimensions>>,
         baseMessage: String,
         thumbnailFile: File?,
-        pulser: ChatActionPulser
+        pulser: ChatActionPulser,
+        replyMarkup: InlineKeyboardMarkup? = null
     ): Boolean {
         val total = chunks.size
         chunks.forEachIndexed { index, (file, dims) ->
             val number = index + 1
             val statusMessage = if (total > 1) "$baseMessage\nSending Video (Part $number of $total)..."
                                 else "$baseMessage\nSending Video..."
-            editMessageText(chatId, intermediateMessageId, statusMessage)
+            editMessageText(chatId, intermediateMessageId, statusMessage, replyMarkup)
             logger.info("Sending Video chunk $number of $total...")
             pulser.set("upload_video")
             val caption = if (total > 1) "$baseMessage\n\nPart $number of $total" else baseMessage

@@ -13,17 +13,17 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.Charset
 
-class OdesilService {
+class OdesilService(private val musicSearch: MusicSearchService? = null) {
     private val logger = getLogger()
     private val client = HttpClient.newBuilder().build()
     private val objectMapper = ObjectMapper().apply {
         configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
     }
 
-    fun detect(messageEntity: MessageEntity): OdesilEntity? =
+    suspend fun detect(messageEntity: MessageEntity): OdesilEntity? =
         detect(messageEntity.text)?.let { OdesilEntity(it, messageEntity) }
 
-    fun detect(url: String): OdesilResponse? {
+    suspend fun detect(url: String): OdesilResponse? {
         val encodedUrl = URLEncoder.encode(url.substringBefore("?list="), Charset.defaultCharset())
         val request = HttpRequest.newBuilder()
             .uri(URI.create("https://api.song.link/v1-alpha.1/links?url=$encodedUrl"))
@@ -34,7 +34,8 @@ class OdesilService {
             logger.info("Odesil fail: $body")
             return null
         }
-        return objectMapper.readValue(body, OdesilResponse::class.java)
+        val parsed = objectMapper.readValue(body, OdesilResponse::class.java)
+        return musicSearch?.enrichMissingPlatforms(parsed) ?: parsed
     }
 
     private fun retryRequest(request: HttpRequest): HttpResponse<String>? {

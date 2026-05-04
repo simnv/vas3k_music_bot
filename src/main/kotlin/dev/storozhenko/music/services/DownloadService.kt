@@ -7,6 +7,9 @@ import dev.storozhenko.music.shellJoin
 import dev.storozhenko.music.validateThumbnailFile
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import java.io.BufferedReader
 import java.io.File
@@ -57,26 +60,39 @@ class DownloadService(
         ))
     }
 
-    suspend fun download(filename: String, url: String, vararg params: String): File? = runInterruptible(virtualDispatcher) {
+    suspend fun download(filename: String, url: String, vararg params: String): File? = coroutineScope {
         logger.info("Running yt-dlp for $url...")
         val folder = File("/tmp", UUID.randomUUID().toString()).apply { mkdir() }
         val command = listOf(ytdlLocation, url, "-o", "${folder.absolutePath}/$filename") + params.toList()
         logger.info(command.shellJoin())
         val process = ProcessBuilder(command).redirectErrorStream(true).start()
-        BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-            reader.lineSequence().forEach { logger.info(it) }
+        val readerJob = launch(virtualDispatcher) {
+            runCatching {
+                BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+                    reader.lineSequence().forEach { logger.info(it) }
+                }
+            }
         }
-        process.waitFor()
+        try {
+            process.onExit().await()
+        } finally {
+            if (process.isAlive) {
+                logger.info("yt-dlp interrupted, force-destroying subprocess for $url")
+                process.destroyForcibly()
+                folder.deleteRecursively()
+            }
+            readerJob.cancel()
+        }
         logger.info("Finished running yt-dlp for $url")
         val files = folder.listFiles()
         if (files == null || files.isEmpty()) {
             logger.error("Can't download file for url $url")
-            return@runInterruptible null
+            return@coroutineScope null
         }
         val mediaFile = files.firstOrNull { it.extension.lowercase() !in imageExtensions }
             ?: run {
                 logger.error("No media file found for url $url, only: ${files.map { it.name }}")
-                return@runInterruptible null
+                return@coroutineScope null
             }
         scheduleDelete(mediaFile)
         mediaFile
