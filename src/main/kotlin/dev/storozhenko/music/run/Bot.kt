@@ -12,6 +12,7 @@ import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.MediaProbeService
 import dev.storozhenko.music.services.MediaProcessingService
 import dev.storozhenko.music.services.OdesilService
+import dev.storozhenko.music.services.VideoMeta
 import dev.storozhenko.music.services.TelegramSender
 import dev.storozhenko.music.services.UrlValidator
 import dev.storozhenko.music.split2ByDash
@@ -32,6 +33,7 @@ import org.telegram.telegrambots.meta.api.objects.Update
 import org.telegram.telegrambots.meta.generics.TelegramClient
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
+import java.net.URL
 import java.util.UUID
 import java.util.concurrent.Executors
 import org.jsoup.Jsoup
@@ -154,8 +156,21 @@ class Bot(
             }
         } else if (!validLinks.isEmpty()) {
             val validLink = validLinks.first()
-            val videoTitle = downloader.getVideoTitle(validLink.text)
-            linksMessage = "$videoTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+            val meta = downloader.getVideoMeta(validLink.text)
+            val displayTitle = formatTitleWithDuration(meta)
+            val isMusicChat = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
+            val odesilFromTitle = if (isMusicChat && isVkOrRutube(validLink.text) && meta.title.isNotBlank()) {
+                val searchQuery = stripAnnotations(meta.title)
+                downloader.ytSearchFirst(searchQuery, meta.durationSec)?.let { ytUrl ->
+                    logger.info("VK/RuTube in music chat: probing Odesli via YT search '$ytUrl'")
+                    odesilService.detect(ytUrl)
+                }
+            } else null
+            linksMessage = if (odesilFromTitle != null) {
+                mapOdesilResponse(odesilFromTitle) + "\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+            } else {
+                "$displayTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+            }
         }
 
         val youtubeFromMessage = extractFirstUrlByText(linksMessage, "Youtube")
@@ -264,7 +279,8 @@ class Bot(
 
         try {
             pulser.set("typing")
-            sender.editMessageText(chatId, intermediateMessageId, "$message\nDownloading ${quality.label}... Use <code>low</code>/<code>medium</code>/<code>high</code> or <code>audio</code> after link to change.")
+            val downloadingMsg = if (quality == Quality.HIGH) "Downloading..." else "Downloading <code>${quality.label}</code>..."
+            sender.editMessageText(chatId, intermediateMessageId, "$message\n$downloadingMsg Use <code>low</code>/<code>medium</code>/<code>high</code> or <code>audio</code> after link to change quality.")
             val downloadParams = downloader.commonYtDlpFlags(url) + listOf(
                 "-f", quality.formatSelector,
                 "--merge-output-format", "mp4"
@@ -292,10 +308,11 @@ class Bot(
             thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
             
             sender.editMessageText(chatId, intermediateMessageId, "$message\nGetting dimensions...")
-            val videoDuration = probe.getVideoDimensions(downloadedFile)?.duration ?: run {
+            val videoDims = probe.getVideoDimensions(downloadedFile) ?: run {
                 sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions")
                 return false
             }
+            val videoDuration = videoDims.duration
             
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
             var sendVideo = true
@@ -361,6 +378,9 @@ class Bot(
             }
 
             if (sendVideo) {
+                if (thumbnailFile != null && videoDims.height > videoDims.width) {
+                    thumbnailFile = runCatching { processor.convertToLandscapeThumbnail(thumbnailFile!!) }.getOrNull() ?: thumbnailFile
+                }
                 val probedChunks = chunkFiles.map { f ->
                     val dims = probe.getVideoDimensions(f) ?: run {
                         sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ Failed to get video dimensions for a chunk")
@@ -436,5 +456,22 @@ class Bot(
         val element = doc.select("a:containsOwn($linkText)").first()
         return element?.attr("href")
     }
+
+    private fun formatTitleWithDuration(meta: VideoMeta): String =
+        meta.durationSec?.let { "${meta.title} [%02d:%02d]".format(it / 60, it % 60) } ?: meta.title
+
+    private fun stripAnnotations(s: String): String =
+        s.replace(Regex("\\s*\\[[^\\]]*\\]"), "")
+            .replace(Regex("\\s*\\([^)]*\\)"), "")
+            .trim()
+            .replace(Regex("\\s+"), " ")
+
+    private fun isVkOrRutube(url: String): Boolean = runCatching {
+        val host = URL(url).host.lowercase()
+        host == "rutube.ru" || host.endsWith(".rutube.ru") ||
+            host == "vk.com" || host.endsWith(".vk.com") ||
+            host == "vk.ru" || host.endsWith(".vk.ru") ||
+            host == "vkvideo.ru" || host.endsWith(".vkvideo.ru")
+    }.getOrDefault(false)
 
 }

@@ -20,8 +20,11 @@ class OdesilService {
         configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
     }
 
-    fun detect(messageEntity: MessageEntity): OdesilEntity? {
-        val encodedUrl = URLEncoder.encode(messageEntity.text.substringBefore("?list="), Charset.defaultCharset())
+    fun detect(messageEntity: MessageEntity): OdesilEntity? =
+        detect(messageEntity.text)?.let { OdesilEntity(it, messageEntity) }
+
+    fun detect(url: String): OdesilResponse? {
+        val encodedUrl = URLEncoder.encode(url.substringBefore("?list="), Charset.defaultCharset())
         val request = HttpRequest.newBuilder()
             .uri(URI.create("https://api.song.link/v1-alpha.1/links?url=$encodedUrl"))
             .build()
@@ -31,8 +34,7 @@ class OdesilService {
             logger.info("Odesil fail: $body")
             return null
         }
-        val odesilResponse = objectMapper.readValue(body, OdesilResponse::class.java)
-        return OdesilEntity(odesilResponse, messageEntity)
+        return objectMapper.readValue(body, OdesilResponse::class.java)
     }
 
     private fun retryRequest(request: HttpRequest): HttpResponse<String>? {

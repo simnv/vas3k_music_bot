@@ -45,7 +45,7 @@ data class RequestOptions(val quality: Quality, val forceAudio: Boolean)
 
 fun parseRequestOptions(text: String): RequestOptions {
     val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
-    if (tokens.isEmpty()) return RequestOptions(Quality.MEDIUM, false)
+    if (tokens.isEmpty()) return RequestOptions(Quality.HIGH, false)
     val lastIdx = tokens.size - 1
     var quality: Quality? = null
     var forceAudio = false
@@ -68,7 +68,7 @@ fun parseRequestOptions(text: String): RequestOptions {
                 (atBoundary && (tok == "a" || tok == "s"))
         }
     }
-    return RequestOptions(quality ?: Quality.MEDIUM, forceAudio)
+    return RequestOptions(quality ?: Quality.HIGH, forceAudio)
 }
 
 fun validateVideoFile(videoFile: File): Pair<Boolean, String> {

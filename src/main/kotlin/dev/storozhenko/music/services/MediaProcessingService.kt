@@ -52,14 +52,20 @@ class MediaProcessingService(
         chunkFiles.sortedBy { it.name }
     }
 
-    suspend fun convertToSquareThumbnail(inputFile: File): File = runInterruptible(virtualDispatcher) {
-        logger.info("Cropping thumbnail ${inputFile.absolutePath} to square...")
-        val outputFile = File(inputFile.parentFile, "${UUID.randomUUID()}_square_thumb.jpg")
+    suspend fun convertToSquareThumbnail(inputFile: File): File =
+        cropThumbnail(inputFile, "square", "crop='min(iw\\,ih)':'min(iw\\,ih)',scale=320:320")
+
+    suspend fun convertToLandscapeThumbnail(inputFile: File): File =
+        cropThumbnail(inputFile, "landscape", "crop='min(iw\\,ih*16/9)':'min(ih\\,iw*9/16)',scale=320:-2")
+
+    private suspend fun cropThumbnail(inputFile: File, label: String, filter: String): File = runInterruptible(virtualDispatcher) {
+        logger.info("Cropping thumbnail ${inputFile.absolutePath} to $label...")
+        val outputFile = File(inputFile.parentFile, "${UUID.randomUUID()}_${label}_thumb.jpg")
         val command = listOf(
             "ffmpeg",
             "-hide_banner", "-nostats", "-loglevel", "error",
             "-i", inputFile.absolutePath,
-            "-vf", "crop='min(iw\\,ih)':'min(iw\\,ih)',scale=320:320",
+            "-vf", filter,
             "-q:v", "2",
             outputFile.absolutePath
         )
@@ -72,8 +78,8 @@ class MediaProcessingService(
         }
         val exitCode = process.waitFor()
         if (exitCode != 0) {
-            logger.error("ffmpeg square-thumbnail failed with exit code $exitCode")
-            throw RuntimeException("Failed to crop thumbnail to square")
+            logger.error("ffmpeg $label-thumbnail failed with exit code $exitCode")
+            throw RuntimeException("Failed to crop thumbnail to $label")
         }
         scheduleDelete(outputFile)
         outputFile

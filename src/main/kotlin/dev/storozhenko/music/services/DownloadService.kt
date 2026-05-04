@@ -13,6 +13,8 @@ import java.io.File
 import java.io.InputStreamReader
 import java.util.UUID
 
+data class VideoMeta(val title: String, val durationSec: Int?)
+
 class DownloadService(
     private val ytdlLocation: String,
     private val virtualDispatcher: CoroutineDispatcher,
@@ -92,9 +94,14 @@ class DownloadService(
         return candidate
     }
 
-    suspend fun ytSearchFirst(query: String): String? = runInterruptible(virtualDispatcher) {
-        logger.info("Running yt-dlp ytsearch for: $query")
-        val command = listOf(
+    suspend fun ytSearchFirst(query: String, durationSec: Int? = null): String? = runInterruptible(virtualDispatcher) {
+        logger.info("Running yt-dlp ytsearch for: $query (duration=$durationSec)")
+        val (searchPrefix, matchFilter) = if (durationSec != null) {
+            val low = (durationSec - 15).coerceAtLeast(1)
+            val high = durationSec + 15
+            "ytsearch5" to "duration > $low & duration < $high"
+        } else "ytsearch1" to null
+        val command = mutableListOf(
             "yt-dlp",
             "--cookies", "/cookies.txt",
             "--print", "%(webpage_url)s",
@@ -103,9 +110,10 @@ class DownloadService(
             "--remote-components", "ejs:github",
             "--retries", "5",
             "--fragment-retries", "5",
-            "--socket-timeout", "30",
-            "ytsearch1:$query"
+            "--socket-timeout", "30"
         )
+        matchFilter?.let { command.addAll(listOf("--match-filter", it)) }
+        command.add("$searchPrefix:$query")
         logger.info(command.shellJoin())
         try {
             val process = ProcessBuilder(command).redirectErrorStream(true).start()
@@ -119,13 +127,13 @@ class DownloadService(
         }
     }
 
-    suspend fun getVideoTitle(url: String): String = runInterruptible(virtualDispatcher) {
+    suspend fun getVideoMeta(url: String): VideoMeta = runInterruptible(virtualDispatcher) {
         logger.info("Running yt-dlp to get title and duration for $url...")
         val command = mutableListOf<String>().apply {
             addAll(listOf(
                 "yt-dlp",
                 "--cookies", "/cookies.txt",
-                "--print", "%(title)s [%(duration)s]",
+                "--print", "%(title)s\t%(duration)s",
                 "--js-runtimes", "deno:/usr/bin/deno",
                 "--remote-components", "ejs:github",
                 "--retries", "5",
@@ -138,14 +146,12 @@ class DownloadService(
         }
         logger.info(command.shellJoin())
         val process = ProcessBuilder(command).redirectErrorStream(true).start()
-        val output = BufferedReader(InputStreamReader(process.inputStream)).readLine()
+        val output = BufferedReader(InputStreamReader(process.inputStream)).readLine() ?: ""
         logger.info("Got $output from yt-dlp")
         process.waitFor()
-        if (output.contains(": No video formats found!")) return@runInterruptible ""
-        output.replace(Regex("\\[(\\d+)\\]")) { match ->
-            val seconds = match.groupValues[1].toInt()
-            " [%02d:%02d]".format(seconds / 60, seconds % 60)
-        }
+        if (output.contains(": No video formats found!")) return@runInterruptible VideoMeta("", null)
+        val parts = output.split("\t", limit = 2)
+        VideoMeta(parts.getOrNull(0).orEmpty(), parts.getOrNull(1)?.toIntOrNull())
     }
 
     private fun scheduleDelete(file: File) {
