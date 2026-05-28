@@ -84,7 +84,10 @@ class ErrorNotificationService(
     public fun sendMessageWithSourceInfo(message: String, authorName: String?, authorUsername: String?, chatId: Long, messageId: Int, chatTitle: String, requestMode: String? = null) {
         try {
             val timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now())
-            val chatLinkId = chatId.toString().removePrefix("-100")
+            // Strip both "-100" (supergroup prefix) and a lone leading "-" so the link is at
+            // least well-formed for basic groups too — Telegram opens it correctly for some.
+            val chatLinkId = chatId.toString().removePrefix("-100").removePrefix("-")
+            val chatRef = "<a href=\"https://t.me/c/$chatLinkId/$messageId\">$chatTitle</a>"
             val notificationMessage = buildString {
                 append("ℹ️ <b>Request from</b> ")
 
@@ -96,7 +99,7 @@ class ErrorNotificationService(
                     append("@$authorUsername")
                 }
 
-                append(" in <a href=\"https://t.me/c/$chatLinkId/$messageId\">$chatTitle</a>")
+                append(" in $chatRef")
                 if (requestMode != null) {
                     append("\n<b>Mode:</b> <code>$requestMode</code>")
                 }
