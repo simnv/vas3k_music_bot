@@ -39,20 +39,35 @@ class MediaProbeService(private val virtualDispatcher: CoroutineDispatcher) {
         val command = listOf(
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height:format=duration",
-            "-of", "csv=p=0:s=,",
+            "-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate:format=duration",
+            "-of", "default=noprint_wrappers=1",
             videoFile.absolutePath
         )
         val process = ProcessBuilder(command).redirectErrorStream(true).start()
         val lines = BufferedReader(InputStreamReader(process.inputStream)).readLines()
         logger.info("Got ${lines.size} lines from ffprobe: $lines")
         process.waitFor()
-        val raw = if (lines.size >= 2) "${lines[0]},${lines[1]}" else lines.firstOrNull() ?: ""
+        val values = lines.mapNotNull { line ->
+            val idx = line.indexOf('=')
+            if (idx <= 0) null else line.substring(0, idx).trim() to line.substring(idx + 1).trim()
+        }.toMap()
         runCatching {
-            val parts = raw.split(",").map { it.toDouble().toInt() }
-            VideoDimensions(parts[0], parts[1], parts[2])
+            val rawWidth = values.getValue("width").toDouble().toInt()
+            val rawHeight = values.getValue("height").toDouble().toInt()
+            val duration = values.getValue("duration").toDouble().toInt()
+            // ffprobe reports the *stored* frame size; phone/Shorts videos are often stored
+            // landscape with a rotation tag, so swap to display dimensions on 90°/270° rotation.
+            val rotation = values.entries
+                .firstOrNull { it.key.equals("rotation", true) || it.key.endsWith("rotate", true) }
+                ?.value?.toDoubleOrNull()?.toInt() ?: 0
+            val swap = Math.floorMod(rotation, 180) == 90
+            VideoDimensions(
+                width = if (swap) rawHeight else rawWidth,
+                height = if (swap) rawWidth else rawHeight,
+                duration = duration
+            )
         }.getOrElse {
-            logger.error("Failed to parse video dimensions: $raw", it)
+            logger.error("Failed to parse video dimensions: $lines", it)
             null
         }
     }
