@@ -189,7 +189,8 @@ class Bot(
             coroutine.async { downloader.download("${UUID.randomUUID()}.%(ext)s", url, *flags.toTypedArray()) }
         }
 
-        val pulser = sender.startPulser(chatId, "typing")
+        val isKnownMusic = validLinks.isNotEmpty() || urlEntities.any { isKnownOdesliMusicUrl(it.text) }
+        var pulser: TelegramSender.ChatActionPulser? = if (isKnownMusic) sender.startPulser(chatId, "typing") else null
         val cancelToken = UUID.randomUUID().toString()
         activeJobs[cancelToken] = requireNotNull(currentCoroutineContext()[Job]) { "no Job in coroutine context" }
         val cancelKb = cancelKeyboard(cancelToken)
@@ -219,6 +220,9 @@ class Bot(
             logger.info("No links from Odesil or valid video services, returning")
             return
         }
+
+        // If the URL host wasn't a known music host but Odesli matched anyway, start pulser now.
+        if (pulser == null) pulser = sender.startPulser(chatId, "typing")
 
         lateinit var linksMessage: String
         if (!links.isEmpty()) {
@@ -301,7 +305,7 @@ class Bot(
         // prefetched download is reused instead of being thrown away in favor of a YT redownload.
         val downloadUrl = validLinks.firstOrNull()?.text ?: youtubeFromMessage ?: ytSearchUrl
         val success = if (downloadUrl != null) {
-            downloadAndSendVideo(downloadUrl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser, cancelKb, prefetchUrl, prefetchedDownload)
+            downloadAndSendVideo(downloadUrl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser!!, cancelKb, prefetchUrl, prefetchedDownload)
         } else {
             false
         }
@@ -319,7 +323,7 @@ class Bot(
         } finally {
             prefetchedDownload?.cancel()
             activeJobs.remove(cancelToken)
-            pulser.close()
+            pulser?.close()
         }
     }
 
@@ -567,6 +571,26 @@ class Bot(
         val row = InlineKeyboardRow().apply { add(button) }
         return InlineKeyboardMarkup.builder().keyboardRow(row).build()
     }
+
+    // Hosts where we know we'll do real work — either validLinks-downloadable (handled by
+    // UrlValidator) or Odesli-recognized music platforms. Used to gate the early "typing" pulser
+    // so random non-music URLs don't trigger a speculative chat-action.
+    private val odesliKnownHosts = setOf(
+        "music.youtube.com",
+        "music.yandex.ru", "music.yandex.com",
+        "music.apple.com", "itunes.apple.com",
+        "open.spotify.com",
+        "soundcloud.com",
+        "deezer.com",
+        "tidal.com",
+        "music.amazon.com", "amazon.com",
+        "pandora.com",
+    )
+
+    private fun isKnownOdesliMusicUrl(url: String): Boolean = runCatching {
+        val host = URL(url).host.lowercase()
+        odesliKnownHosts.any { host == it || host.endsWith(".$it") }
+    }.getOrDefault(false)
 
     private fun isVkOrRutube(url: String): Boolean = runCatching {
         val host = URL(url).host.lowercase()
