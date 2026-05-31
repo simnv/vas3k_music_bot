@@ -55,8 +55,8 @@ class MediaProcessingService(
     suspend fun convertToSquareThumbnail(inputFile: File): File =
         cropThumbnail(inputFile, "square", "crop='min(iw\\,ih)':'min(iw\\,ih)',scale=320:320")
 
-    suspend fun convertToLandscapeThumbnail(inputFile: File): File =
-        cropThumbnail(inputFile, "landscape", "crop='min(iw\\,ih*16/9)':'min(ih\\,iw*9/16)',scale=320:-2")
+    suspend fun convertToPortraitThumbnail(inputFile: File): File =
+        cropThumbnail(inputFile, "portrait", "crop='min(iw\\,ih*9/16)':'min(ih\\,iw*16/9)',scale=-2:320")
 
     private suspend fun cropThumbnail(inputFile: File, label: String, filter: String): File = runInterruptible(virtualDispatcher) {
         logger.info("Cropping thumbnail ${inputFile.absolutePath} to $label...")

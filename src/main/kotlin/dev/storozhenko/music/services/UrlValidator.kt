@@ -1,7 +1,7 @@
 package dev.storozhenko.music.services
 
 import dev.storozhenko.music.getLogger
-import java.net.URL
+import java.net.URI
 
 class UrlValidator {
     private val logger = getLogger()
@@ -36,7 +36,7 @@ class UrlValidator {
 
     fun isValidDownloadUrl(urlString: String): Boolean = runCatching {
         logger.info("Validating URL: $urlString")
-        val url = URL(urlString)
+        val url = URI(urlString)
         val host = url.host.lowercase()
         val path = url.path.lowercase()
         logger.info("Parsed URL - host: $host, path: $path")

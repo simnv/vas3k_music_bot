@@ -81,6 +81,40 @@ class ErrorNotificationService(
     fun sendServiceErrorNotification(throwable: Throwable, serviceName: String) {
         sendErrorNotification(throwable, "Service Error: $serviceName")
     }
+    fun sendCancellationNotification(
+        clickerName: String?,
+        clickerUsername: String?,
+        chatTitle: String,
+        chatId: Long,
+        messageId: Int,
+        url: String?,
+    ) {
+        try {
+            val chatLinkId = chatId.toString().removePrefix("-100").removePrefix("-")
+            val chatRef = "<a href=\"https://t.me/c/$chatLinkId/$messageId\">$chatTitle</a>"
+            val who = when {
+                clickerName != null && clickerUsername != null -> "$clickerName (@$clickerUsername)"
+                clickerName != null -> clickerName
+                clickerUsername != null -> "@$clickerUsername"
+                else -> "unknown user"
+            }
+            val urlPart = url?.let { "\n<b>URL:</b> $it" } ?: ""
+            val text = "❌ <b>Cancelled by</b> $who in $chatRef$urlPart"
+
+            val sendMessage = SendMessage.builder()
+                .chatId(errorNotificationTelegramId)
+                .text(text)
+                .parseMode("HTML")
+                .disableWebPagePreview(true)
+                .build()
+
+            telegramClient.execute(sendMessage)
+            logger.info("Cancellation notification sent successfully")
+        } catch (e: Exception) {
+            logger.error("Failed to send cancellation notification: ${e.message}", e)
+        }
+    }
+
     public fun sendMessageWithSourceInfo(message: String, authorName: String?, authorUsername: String?, chatId: Long, messageId: Int, chatTitle: String, requestMode: String? = null) {
         try {
             val timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now())

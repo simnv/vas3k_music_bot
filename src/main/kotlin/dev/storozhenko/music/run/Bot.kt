@@ -47,7 +47,7 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKe
 import org.telegram.telegrambots.meta.generics.TelegramClient
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
-import java.net.URL
+import java.net.URI
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -86,7 +86,16 @@ class Bot(
         .associate { (id, prefix) -> id.toLong() to prefix }
     private val fileDeleteScope = CoroutineScope(Dispatchers.Default + SupervisorJob() + handler)
     private val processorScope = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
-    private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val activeJobs = ConcurrentHashMap<String, CancellableJob>()
+
+    private data class CancellableJob(
+        val job: Job,
+        val url: String?,
+        val chatId: Long,
+        val chatTitle: String,
+        val originalMessageId: Int,
+    )
+
     private val emptyKeyboard: InlineKeyboardMarkup = InlineKeyboardMarkup.builder().build()
 
     init {
@@ -124,9 +133,17 @@ class Bot(
         val data = query.data ?: return
         if (!data.startsWith("cancel:")) return
         val token = data.substringAfter("cancel:")
-        val job = activeJobs.remove(token)
-        val text = if (job != null) {
-            job.cancel(CancellationException("user cancelled via button"))
+        val cancellable = activeJobs.remove(token)
+        val text = if (cancellable != null) {
+            val from = query.from
+            val clickerName = from?.let { listOfNotNull(it.firstName, it.lastName).joinToString(" ").ifBlank { null } }
+            val clickerUsername = from?.userName
+            errorNotificationService?.sendCancellationNotification(
+                clickerName, clickerUsername,
+                cancellable.chatTitle, cancellable.chatId, cancellable.originalMessageId,
+                cancellable.url,
+            )
+            cancellable.job.cancel(CancellationException("user cancelled via button"))
             "Отменено"
         } else {
             query.message?.let { msg ->
@@ -192,7 +209,15 @@ class Bot(
         val isKnownMusic = validLinks.isNotEmpty() || urlEntities.any { isKnownOdesliMusicUrl(it.text) }
         var pulser: TelegramSender.ChatActionPulser? = if (isKnownMusic) sender.startPulser(chatId, "typing") else null
         val cancelToken = UUID.randomUUID().toString()
-        activeJobs[cancelToken] = requireNotNull(currentCoroutineContext()[Job]) { "no Job in coroutine context" }
+        val originalChatTitle = update.message.chat.title ?: "Private Chat"
+        val originalUrl = validLinks.firstOrNull()?.text ?: urlEntities.firstOrNull()?.text
+        activeJobs[cancelToken] = CancellableJob(
+            job = requireNotNull(currentCoroutineContext()[Job]) { "no Job in coroutine context" },
+            url = originalUrl,
+            chatId = chatId,
+            chatTitle = originalChatTitle,
+            originalMessageId = update.message.messageId,
+        )
         val cancelKb = cancelKeyboard(cancelToken)
         val replyToMessageId = update.message.getMessageId()
         var tmId: Int? = null
@@ -305,7 +330,7 @@ class Bot(
         // prefetched download is reused instead of being thrown away in favor of a YT redownload.
         val downloadUrl = validLinks.firstOrNull()?.text ?: youtubeFromMessage ?: ytSearchUrl
         val success = if (downloadUrl != null) {
-            downloadAndSendVideo(downloadUrl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser!!, cancelKb, prefetchUrl, prefetchedDownload)
+            downloadAndSendVideo(downloadUrl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser, cancelKb, prefetchUrl, prefetchedDownload)
         } else {
             false
         }
@@ -318,7 +343,6 @@ class Bot(
                     runCatching { sender.deleteMessage(chatId, id) }
                 }
             }
-            errorNotificationService?.sendErrorNotification(e, "Cancelled by user")
             throw e
         } finally {
             prefetchedDownload?.cancel()
@@ -466,7 +490,7 @@ class Bot(
 
             if (sendVideo) {
                 if (thumbnailFile != null && videoDims.height > videoDims.width) {
-                    thumbnailFile = runCatching { processor.convertToLandscapeThumbnail(thumbnailFile!!) }.getOrNull() ?: thumbnailFile
+                    thumbnailFile = runCatching { processor.convertToPortraitThumbnail(thumbnailFile) }.getOrNull() ?: thumbnailFile
                 }
                 val probedChunks = chunkFiles.map { f ->
                     val dims = probe.getVideoDimensions(f) ?: run {
@@ -588,12 +612,12 @@ class Bot(
     )
 
     private fun isKnownOdesliMusicUrl(url: String): Boolean = runCatching {
-        val host = URL(url).host.lowercase()
+        val host = URI(url).host.lowercase()
         odesliKnownHosts.any { host == it || host.endsWith(".$it") }
     }.getOrDefault(false)
 
     private fun isVkOrRutube(url: String): Boolean = runCatching {
-        val host = URL(url).host.lowercase()
+        val host = URI(url).host.lowercase()
         host == "rutube.ru" || host.endsWith(".rutube.ru") ||
             host == "vk.com" || host.endsWith(".vk.com") ||
             host == "vk.ru" || host.endsWith(".vk.ru") ||

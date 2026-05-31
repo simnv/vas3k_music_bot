@@ -159,6 +159,9 @@
                 </executions>
                 <configuration>
                     <jvmTarget>21</jvmTarget>
+                    <args>
+                        <arg>-Xannotation-default-target=param-property</arg>
+                    </args>
                 </configuration>
             </plugin>
             <plugin>
