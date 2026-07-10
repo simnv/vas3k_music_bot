@@ -41,13 +41,10 @@ import org.telegram.telegrambots.meta.api.objects.LinkPreviewOptions
 import org.telegram.telegrambots.meta.api.objects.MessageEntity
 import org.telegram.telegrambots.meta.api.objects.Update
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardRow
 import org.telegram.telegrambots.meta.generics.TelegramClient
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 class Bot(
@@ -84,15 +81,7 @@ class Bot(
         .associate { (id, prefix) -> id.toLong() to prefix }
     private val fileDeleteScope = CoroutineScope(Dispatchers.Default + SupervisorJob() + handler)
     private val processorScope = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
-    private val activeJobs = ConcurrentHashMap<String, CancellableJob>()
-
-    private data class CancellableJob(
-        val job: Job,
-        val url: String?,
-        val chatId: Long,
-        val chatTitle: String,
-        val originalMessageId: Int,
-    )
+    private val jobs = JobRegistry()
 
     private val emptyKeyboard: InlineKeyboardMarkup = InlineKeyboardMarkup.builder().build()
 
@@ -131,7 +120,7 @@ class Bot(
         val data = query.data ?: return
         if (!data.startsWith("cancel:")) return
         val token = data.substringAfter("cancel:")
-        val cancellable = activeJobs.remove(token)
+        val cancellable = jobs.take(token)
         val text = if (cancellable != null) {
             val from = query.from
             val clickerName = from?.let { listOfNotNull(it.firstName, it.lastName).joinToString(" ").ifBlank { null } }
@@ -209,14 +198,17 @@ class Bot(
         val cancelToken = UUID.randomUUID().toString()
         val originalChatTitle = update.message.chat.title ?: "Private Chat"
         val originalUrl = validLinks.firstOrNull()?.text ?: urlEntities.firstOrNull()?.text
-        activeJobs[cancelToken] = CancellableJob(
-            job = requireNotNull(currentCoroutineContext()[Job]) { "no Job in coroutine context" },
-            url = originalUrl,
-            chatId = chatId,
-            chatTitle = originalChatTitle,
-            originalMessageId = update.message.messageId,
+        jobs.register(
+            cancelToken,
+            CancellableJob(
+                job = requireNotNull(currentCoroutineContext()[Job]) { "no Job in coroutine context" },
+                url = originalUrl,
+                chatId = chatId,
+                chatTitle = originalChatTitle,
+                originalMessageId = update.message.messageId,
+            )
         )
-        val cancelKb = cancelKeyboard(cancelToken)
+        val cancelKb = jobs.cancelKeyboard(cancelToken)
         val replyToMessageId = update.message.getMessageId()
         var tmId: Int? = null
         try {
@@ -344,7 +336,7 @@ class Bot(
             throw e
         } finally {
             prefetchedDownload?.cancel()
-            activeJobs.remove(cancelToken)
+            jobs.remove(cancelToken)
             pulser?.close()
         }
     }
@@ -544,15 +536,6 @@ class Bot(
             runCatching { deferred.await() }.getOrNull()?.delete()
         }
         return downloader.download("${UUID.randomUUID()}.%(ext)s", url, *flags.toTypedArray())
-    }
-
-    private fun cancelKeyboard(token: String): InlineKeyboardMarkup {
-        val button = InlineKeyboardButton.builder()
-            .text("❌ Отмена")
-            .callbackData("cancel:$token")
-            .build()
-        val row = InlineKeyboardRow().apply { add(button) }
-        return InlineKeyboardMarkup.builder().keyboardRow(row).build()
     }
 
 }
