@@ -25,7 +25,7 @@ private val chunkSizeMB = System.getenv()["CHUNK_SIZE_MB"]?.takeIf(String::isNot
 private val ytdlProxy = System.getenv()["YTDL_PROXY"]?.takeIf(String::isNotBlank)
 private val ytdlProxyUrlContains = System.getenv()["YTDL_PROXY_URL_CONTAINS"]?.takeIf(String::isNotBlank)
 private val jobMarkerDir = System.getenv()["JOB_MARKER_DIR"]?.takeIf(String::isNotBlank) ?: "/data/jobs"
-private val maxConcurrentDownloads = System.getenv()["MAX_CONCURRENT_DOWNLOADS"]?.takeIf(String::isNotBlank)?.toIntOrNull() ?: 4
+private val maxConcurrentDownloads = System.getenv()["MAX_CONCURRENT_DOWNLOADS"]?.takeIf(String::isNotBlank)?.toIntOrNull() ?: 32
 private val maxConcurrentDownloadsPerChat = System.getenv()["MAX_CONCURRENT_DOWNLOADS_PER_CHAT"]?.takeIf(String::isNotBlank)?.toIntOrNull() ?: 2
 
 class RetryInterceptor(private val maxRetries: Int) : Interceptor {

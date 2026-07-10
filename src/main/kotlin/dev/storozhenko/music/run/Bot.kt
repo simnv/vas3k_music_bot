@@ -50,7 +50,7 @@ class Bot(
     private val ytdlProxy: String?,
     private val ytdlProxyUrlContains: String?,
     private val jobMarkerDir: String = "/data/jobs",
-    private val maxConcurrentDownloads: Int = 4,
+    private val maxConcurrentDownloads: Int = 32,
     private val maxConcurrentDownloadsPerChat: Int = 2,
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
