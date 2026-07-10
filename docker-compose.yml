@@ -27,6 +27,12 @@ services:
       - ERROR_NOTIFICATION_TELEGRAM_ID
       - YTDL_PROXY
       - YTDL_PROXY_URL_CONTAINS
+      - TELEGRAM_ALLOW_LIST
+      - CHUNK_SIZE_MB
+      - IPV6_URL_CONTAINS
+      - JOB_MARKER_DIR
+      - MAX_CONCURRENT_DOWNLOADS
+      - MAX_CONCURRENT_DOWNLOADS_PER_CHAT
     depends_on:
       - tgbot-api
     networks:

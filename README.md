@@ -240,6 +240,9 @@ make redeploy-prod
 | `TELEGRAM_BASE_SCHEMA` | No | `https` | Protocol for Bot API (http/https) |
 | `TELEGRAM_BASE_URL` | No | `api.telegram.org` | Hostname of Bot API server |
 | `TELEGRAM_BASE_PORT` | No | `443` | Port for Bot API server |
+| `JOB_MARKER_DIR` | No | `/data/jobs` | Crash-recovery marker directory; falls back to system temp if unwritable |
+| `MAX_CONCURRENT_DOWNLOADS` | No | 4 | Maximum number of concurrent download jobs |
+| `MAX_CONCURRENT_DOWNLOADS_PER_CHAT` | No | 2 | Maximum concurrent downloads per chat; excess jobs show "⏳ In queue..." status |
 
 ## Docker Configuration
 
