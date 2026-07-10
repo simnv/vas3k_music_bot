@@ -63,4 +63,22 @@ class DownloadAdmissionTest {
         testScheduler.advanceUntilIdle()
         assertTrue(admission.hasFreeSlot(1L))
     }
+
+    @Test
+    fun `onWait fires exactly once and only when saturated`() = runTest {
+        val admission = DownloadAdmission(globalLimit = 1, perChatLimit = 1)
+        var waits = 0
+        admission.withSlot(1L, onWait = { waits++ }) { }
+        assertEquals(0, waits)
+
+        val gate = CompletableDeferred<Unit>()
+        launch { admission.withSlot(1L) { gate.await() } }
+        testScheduler.runCurrent()
+        val second = launch { admission.withSlot(1L, onWait = { waits++ }) { } }
+        testScheduler.advanceUntilIdle()
+        assertEquals(1, waits)
+        gate.complete(Unit)
+        second.join()
+        assertEquals(1, waits)
+    }
 }

@@ -16,12 +16,23 @@ class DownloadAdmission(globalLimit: Int, private val perChatLimit: Int) {
     fun hasFreeSlot(chatId: Long): Boolean =
         global.availablePermits > 0 && chatSemaphore(chatId).availablePermits > 0
 
-    /** Runs [block] holding one per-chat and one global slot; suspends (cancellably) until both are free. */
-    suspend fun <T> withSlot(chatId: Long, block: suspend () -> T): T {
+    /**
+     * Runs [block] holding one per-chat and one global slot; suspends (cancellably) until both are free.
+     * [onWait] is invoked at most once, before suspending, if either slot is not immediately available.
+     */
+    suspend fun <T> withSlot(chatId: Long, onWait: suspend () -> Unit = {}, block: suspend () -> T): T {
         val chat = chatSemaphore(chatId)
-        chat.acquire()
+        var notified = false
+        if (!chat.tryAcquire()) {
+            onWait()
+            notified = true
+            chat.acquire()
+        }
         try {
-            global.acquire()
+            if (!global.tryAcquire()) {
+                if (!notified) onWait()
+                global.acquire()
+            }
             try {
                 return block()
             } finally {

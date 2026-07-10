@@ -22,9 +22,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -218,10 +216,14 @@ class Bot(
         var tmId: Int? = null
         var prefetchedDownload: Deferred<File?>? = null
         try {
-            if (validLinks.isNotEmpty() && !admission.hasFreeSlot(chatId)) {
-                tmId = sendStatusMessage(chatId, "⏳ In queue...", replyToMessageId, cancelKb, cancelToken, originalUrl)
-            }
-            admission.withSlot<Unit>(chatId) {
+            admission.withSlot<Unit>(
+                chatId,
+                onWait = {
+                    if (validLinks.isNotEmpty()) {
+                        tmId = sendStatusMessage(chatId, "⏳ In queue...", replyToMessageId, cancelKb, cancelToken, originalUrl)
+                    }
+                },
+            ) {
                 // Prefetch starts only once we hold a slot, so queued jobs don't spawn yt-dlp early.
                 prefetchedDownload = prefetchUrl?.let { url ->
                     val flags = if (forceAudio) downloader.audioFlags(url) else downloader.videoFlags(url, quality.formatSelector)
