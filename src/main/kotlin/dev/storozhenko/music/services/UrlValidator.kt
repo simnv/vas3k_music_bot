@@ -37,7 +37,19 @@ class UrlValidator {
     fun isValidDownloadUrl(urlString: String): Boolean = runCatching {
         logger.info("Validating URL: $urlString")
         val url = URI(urlString)
-        val host = url.host.lowercase()
+        val scheme = url.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") {
+            logger.info("URL rejected: unsupported scheme '$scheme'")
+            return@runCatching false
+        }
+        if (url.userInfo != null) {
+            logger.info("URL rejected: contains userinfo")
+            return@runCatching false
+        }
+        val host = url.host?.lowercase() ?: run {
+            logger.info("URL rejected: no host")
+            return@runCatching false
+        }
         val path = url.path.lowercase()
         logger.info("Parsed URL - host: $host, path: $path")
 

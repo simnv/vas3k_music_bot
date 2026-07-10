@@ -31,4 +31,22 @@ class UrlValidatorTest {
         assertFalse(validator.isValidDownloadUrl(""))
         assertFalse(validator.isValidDownloadUrl("youtube.com/watch?v=abc")) // schemeless
     }
+
+    @Test
+    fun `rejects non-http schemes`() {
+        assertFalse(validator.isValidDownloadUrl("ftp://youtube.com/watch?v=x"))
+        assertFalse(validator.isValidDownloadUrl("javascript:alert(1)"))
+    }
+
+    @Test
+    fun `rejects urls with userinfo`() {
+        assertFalse(validator.isValidDownloadUrl("https://user@youtube.com/watch?v=x"))
+        assertFalse(validator.isValidDownloadUrl("https://user:pass@youtube.com/watch?v=x"))
+    }
+
+    @Test
+    fun `rejects lookalike and literal-ip hosts`() {
+        assertFalse(validator.isValidDownloadUrl("https://youtube.com.evil.com/watch?v=x"))
+        assertFalse(validator.isValidDownloadUrl("https://142.250.68.14/watch?v=x"))
+    }
 }
