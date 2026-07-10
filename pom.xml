@@ -187,7 +187,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.5</version>
                 <configuration>
-                    <argLine>-XX:+EnableDynamicAgentLoading -Dnet.bytebuddy.experimental=true</argLine>
+                    <argLine>-XX:+EnableDynamicAgentLoading -Dnet.bytebuddy.experimental=true -Dkotlinx.coroutines.stacktrace.recovery=false</argLine>
                 </configuration>
             </plugin>
             <plugin>

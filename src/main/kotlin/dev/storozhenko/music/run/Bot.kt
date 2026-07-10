@@ -1,11 +1,8 @@
 package dev.storozhenko.music.run
 
-import dev.storozhenko.music.Quality
 import dev.storozhenko.music.RequestOptions
-import dev.storozhenko.music.eagerlyDelete
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.parseRequestOptions
-import dev.storozhenko.music.removeFirstLine
 import dev.storozhenko.music.services.DownloadService
 import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.MediaProbeService
@@ -15,8 +12,6 @@ import dev.storozhenko.music.services.LinkMessageBuilder
 import dev.storozhenko.music.services.OdesilService
 import dev.storozhenko.music.services.TelegramSender
 import dev.storozhenko.music.services.UrlValidator
-import dev.storozhenko.music.split2ByDash
-import dev.storozhenko.music.validateVideoFile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -42,7 +37,6 @@ import org.telegram.telegrambots.meta.api.objects.MessageEntity
 import org.telegram.telegrambots.meta.api.objects.Update
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup
 import org.telegram.telegrambots.meta.generics.TelegramClient
-import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -68,6 +62,7 @@ class Bot(
     private val probe: MediaProbeService
     private val processor: MediaProcessingService
     private val sender: TelegramSender
+    private val pipeline: DownloadPipeline
     val handler = CoroutineExceptionHandler { _, exception ->
         logger.error("Caught exception: $exception")
         errorNotificationService?.sendErrorNotification(exception)
@@ -83,8 +78,6 @@ class Bot(
     private val processorScope = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
     private val jobs = JobRegistry()
 
-    private val emptyKeyboard: InlineKeyboardMarkup = InlineKeyboardMarkup.builder().build()
-
     init {
         downloader = DownloadService(
             ytdlLocation, virtualDispatcher, fileDeleteScope,
@@ -94,6 +87,7 @@ class Bot(
         probe = MediaProbeService(virtualDispatcher)
         processor = MediaProcessingService(virtualDispatcher, fileDeleteScope, chunkSizeMB, errorNotificationService)
         sender = TelegramSender(telegramClient, coroutine)
+        pipeline = DownloadPipeline(downloader, probe, processor, sender, chunkSizeMB)
     }
 
 
@@ -319,10 +313,22 @@ class Bot(
         // Prefer the user's posted URL (validLinks[0]) over an Odesli-derived YouTube URL, so the
         // prefetched download is reused instead of being thrown away in favor of a YT redownload.
         val downloadUrl = validLinks.firstOrNull()?.text ?: youtubeFromMessage ?: ytSearchUrl
-        val success = if (downloadUrl != null) {
-            downloadAndSendVideo(downloadUrl, message, mid, replyToMessageId, chatId, quality, forceAudio, pulser, cancelKb, prefetchUrl, prefetchedDownload)
-        } else {
-            false
+        if (downloadUrl != null) {
+            pipeline.run(
+                DownloadRequest(
+                    url = downloadUrl,
+                    message = message,
+                    statusMessageId = mid,
+                    replyToMessageId = replyToMessageId,
+                    chatId = chatId,
+                    quality = quality,
+                    forceAudio = forceAudio,
+                    isMusicChat = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true,
+                    prefetchedUrl = prefetchUrl,
+                    prefetchedDownload = prefetchedDownload,
+                ),
+                pulser!!, cancelKb,
+            )
         }
 
         } catch (e: CancellationException) {
@@ -338,168 +344,6 @@ class Bot(
             prefetchedDownload?.cancel()
             jobs.remove(cancelToken)
             pulser?.close()
-        }
-    }
-
-    private suspend fun downloadAndSendAudioOnly(url: String, message: String, intermediateMessageId: Int, chatId: Long, pulser: TelegramSender.ChatActionPulser, cancelKb: InlineKeyboardMarkup? = null, prefetchedUrl: String? = null, prefetchedDownload: Deferred<File?>? = null): Boolean {
-        suspend fun status(suffix: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n$suffix", cancelKb)
-        suspend fun fail(reason: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ $reason", emptyKeyboard)
-        var downloadedFile: File? = null
-        var thumbnailFile: File? = null
-        try {
-            pulser.set("typing")
-            status("Downloading audio...")
-            downloadedFile = awaitOrDownload(prefetchedUrl, prefetchedDownload, url, downloader.audioFlags(url))
-                ?: run { fail("Failed to download audio: empty result"); return false }
-
-            thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
-                ?.let { runCatching { processor.convertToSquareThumbnail(it) }.getOrNull() ?: it }
-            val duration = probe.getMediaDuration(downloadedFile)
-
-            val (artist, title) = message.lineSequence().first().split2ByDash(true)
-            status("Sending Audio...")
-            pulser.set("upload_voice")
-            sender.sendAudioInPlace(
-                audioFile = downloadedFile,
-                chatId = chatId,
-                intermediateMessageId = intermediateMessageId,
-                caption = message.removeFirstLine(),
-                artist = artist,
-                title = title,
-                duration = duration,
-                thumbnailFile = thumbnailFile
-            )
-            logger.info("Audio sent (audio-only fast path)")
-            return true
-        } catch (e: Exception) {
-            logger.error("Error in downloadAndSendAudioOnly: ${e.message}", e)
-            fail("Failed to send audio: ${e.message}")
-            return false
-        } finally {
-            eagerlyDelete(logger, downloadedFile, thumbnailFile)
-        }
-    }
-
-    private suspend fun downloadAndSendVideo(url: String, message:String, intermediateMessageId: Int, rmid: Int, chatId: Long, quality: Quality, forceAudio: Boolean, pulser: TelegramSender.ChatActionPulser, cancelKb: InlineKeyboardMarkup? = null, prefetchedUrl: String? = null, prefetchedDownload: Deferred<File?>? = null): Boolean {
-        if (forceAudio) return downloadAndSendAudioOnly(url, message, intermediateMessageId, chatId, pulser, cancelKb, prefetchedUrl, prefetchedDownload)
-        suspend fun status(suffix: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n$suffix", cancelKb)
-        suspend fun fail(reason: String) = sender.editMessageText(chatId, intermediateMessageId, "$message\n❌ $reason", emptyKeyboard)
-        var downloadedFile: File? = null
-        var thumbnailFile: File? = null
-        var chunkFiles: List<File> = emptyList()
-        var telegramAudioFile: File? = null
-
-        try {
-            pulser.set("typing")
-            val downloadingMsg = if (quality == Quality.HIGH) "Downloading..." else "Downloading <code>${quality.label}</code>..."
-            status("$downloadingMsg Use <code>low</code>/<code>medium</code>/<code>high</code> or <code>audio</code> after link to change quality.")
-            downloadedFile = awaitOrDownload(prefetchedUrl, prefetchedDownload, url, downloader.videoFlags(url, quality.formatSelector))
-                ?: run { fail("Failed to download file: empty result"); return false }
-
-            val (isVideoValid, videoValidationMessage) = validateVideoFile(downloadedFile)
-            if (!isVideoValid) {
-                logger.error("Video validation failed: $videoValidationMessage")
-                fail("Video validation failed: $videoValidationMessage")
-                return false
-            }
-
-            val fileSizeInBytes = downloadedFile.length()
-            val fileSizeInMB = fileSizeInBytes / (1024.0 * 1024.0)
-            logger.info("Downloaded file size: ${String.format("%.2f", fileSizeInMB)} MB (${fileSizeInBytes} bytes)")
-
-            thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
-
-            status("Getting dimensions...")
-            val videoDims = probe.getVideoDimensions(downloadedFile) ?: run {
-                fail("Failed to get video dimensions"); return false
-            }
-            val videoDuration = videoDims.duration
-
-            val (artist, title) = message.lineSequence().first().split2ByDash(true)
-            var sendVideo = true
-            val idHasMusic = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
-
-            if (fileSizeInMB > chunkSizeMB) {
-                status("Splitting video into chunks...")
-                val outputPrefix = "${downloadedFile.parentFile.absolutePath}/${downloadedFile.nameWithoutExtension}_chunk.mp4"
-                chunkFiles = processor.splitVideoIntoChunks(downloadedFile, outputPrefix)
-
-                if (chunkFiles.isEmpty()) {
-                    logger.error("No chunk files were created")
-                    fail("Failed to split video into chunks")
-                    return false
-                }
-
-                logger.info("Video split into ${chunkFiles.size} chunks")
-            } else {
-                chunkFiles = listOf(downloadedFile)
-            }
-
-            if (idHasMusic) {
-                pulser.set("typing")
-                status("Analyzing Video...")
-                sendVideo = probe.decideSendAsVideo(downloadedFile, videoDuration)
-            }
-
-            if (!sendVideo) {
-                logger.info("Sending Audio...")
-                status("Sending Audio...")
-                pulser.set("upload_voice")
-
-                try {
-                    val sourceAudioFile = chunkFiles.first()
-
-                    status("Extracting audio...")
-                    try {
-                        telegramAudioFile = processor.convertToTelegramAudio(sourceAudioFile)
-                    } catch (e: Exception) {
-                        logger.error("Failed to extract audio: ${e.message}", e)
-                        fail("Failed to extract audio: ${e.message}")
-                        return false
-                    }
-
-                    val audioThumbnail = thumbnailFile
-                        ?.let { runCatching { processor.convertToSquareThumbnail(it) }.getOrNull() ?: it }
-                    sender.sendAudioInPlace(
-                        audioFile = telegramAudioFile,
-                        chatId = chatId,
-                        intermediateMessageId = intermediateMessageId,
-                        caption = message.removeFirstLine(),
-                        artist = artist,
-                        title = title,
-                        duration = videoDuration,
-                        thumbnailFile = audioThumbnail
-                    )
-                    logger.info("Audio sent (status morphed in place)")
-                } catch (e: TelegramApiException) {
-                    logger.error("Failed to send audio: ${e.message}", e)
-                    fail("Failed to send audio: ${e.message}")
-                    return false
-                }
-            }
-
-            if (sendVideo) {
-                if (thumbnailFile != null && videoDims.height > videoDims.width) {
-                    thumbnailFile = runCatching { processor.convertToPortraitThumbnail(thumbnailFile) }.getOrNull() ?: thumbnailFile
-                }
-                val probedChunks = chunkFiles.map { f ->
-                    val dims = probe.getVideoDimensions(f) ?: run {
-                        fail("Failed to get video dimensions for a chunk")
-                        return false
-                    }
-                    f to dims
-                }
-                if (!sender.sendVideoChunks(chatId, intermediateMessageId, rmid, probedChunks, message, thumbnailFile, pulser, cancelKb)) return false
-            }
-
-            return true
-        } catch (e: Exception) {
-            logger.error("Error in downloadAndSendVideo: ${e.message}", e)
-            fail("Failed to process video: ${e.message}")
-            return false
-        } finally {
-            val files = (chunkFiles + listOfNotNull(downloadedFile, thumbnailFile, telegramAudioFile)).toTypedArray()
-            eagerlyDelete(logger, *files)
         }
     }
 
@@ -526,16 +370,6 @@ class Bot(
     private fun getResource(name: String): String {
         return this::class.java.classLoader.getResource(name)?.readText()
             ?: throw IllegalStateException("Resource $name is not found")
-    }
-
-    private suspend fun awaitOrDownload(prefetchedUrl: String?, prefetchedDownload: Deferred<File?>?, url: String, flags: List<String>): File? {
-        if (prefetchedDownload != null && prefetchedUrl == url) return prefetchedDownload.await()
-        // URL mismatch — cancel; if it had already completed, recover the orphan file and delete it.
-        prefetchedDownload?.let { deferred ->
-            deferred.cancel()
-            runCatching { deferred.await() }.getOrNull()?.delete()
-        }
-        return downloader.download("${UUID.randomUUID()}.%(ext)s", url, *flags.toTypedArray())
     }
 
 }
