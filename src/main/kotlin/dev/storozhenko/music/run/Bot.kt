@@ -50,7 +50,8 @@ class Bot(
     private val ipv6UrlContains: String?,
     private val chunkSizeMB: Int,
     private val ytdlProxy: String?,
-    private val ytdlProxyUrlContains: String?
+    private val ytdlProxyUrlContains: String?,
+    private val jobMarkerDir: String = "/data/jobs",
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
     private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
@@ -77,6 +78,7 @@ class Bot(
     private val fileDeleteScope = CoroutineScope(Dispatchers.Default + SupervisorJob() + handler)
     private val processorScope = CoroutineScope(virtualDispatcher + SupervisorJob() + handler)
     private val jobs = JobRegistry()
+    private val markerStore = JobMarkerStore(File(jobMarkerDir))
 
     init {
         downloader = DownloadService(
@@ -89,6 +91,10 @@ class Bot(
         sender = TelegramSender(telegramClient, coroutine)
         pipeline = DownloadPipeline(downloader, probe, processor, sender, chunkSizeMB)
     }
+
+    private val orphanSweeper = OrphanSweeper(markerStore, sender)
+
+    suspend fun sweepOrphans() = orphanSweeper.sweep()
 
 
     override fun consume(updates: MutableList<Update>) {
@@ -215,7 +221,7 @@ class Bot(
             // Send a "Downloading..." placeholder right away when we have a downloadable URL,
             // BEFORE Odesli detect, so the user sees feedback within ~0.5s instead of ~1-22s.
             if (validLinks.isNotEmpty()) {
-                tmId = sendStatusMessage(chatId, "Downloading...", replyToMessageId, cancelKb)
+                tmId = sendStatusMessage(chatId, "Downloading...", replyToMessageId, cancelKb, cancelToken, originalUrl)
             }
 
             // Now run Odesli enrichment in parallel with the prefetch download (and the visible placeholder).
@@ -244,7 +250,7 @@ class Bot(
 
             val mid: Int = tmId?.also {
                 sender.editMessageText(chatId, it, "$message\nDownloading...", cancelKb)
-            } ?: sendStatusMessage(chatId, message, replyToMessageId, cancelKb).also { tmId = it }
+            } ?: sendStatusMessage(chatId, message, replyToMessageId, cancelKb, cancelToken, originalUrl).also { tmId = it }
 
             // Prefer the user's posted URL (validLinks[0]) over an Odesli-derived YouTube URL, so the
             // prefetched download is reused instead of being thrown away in favor of a YT redownload.
@@ -275,6 +281,7 @@ class Bot(
             throw e
         } finally {
             prefetchedDownload?.cancel()
+            markerStore.delete(cancelToken)
             jobs.remove(cancelToken)
             pulser?.close()
         }
@@ -352,6 +359,8 @@ class Bot(
         text: String,
         replyToMessageId: Int,
         kb: InlineKeyboardMarkup,
+        cancelToken: String,
+        url: String?,
     ): Int {
         val sendMessage = SendMessage.builder()
             .chatId(chatId.toString())
@@ -362,7 +371,9 @@ class Bot(
             .disableNotification(true)
             .replyMarkup(kb)
             .build()
-        return telegramClient.executeAsync(sendMessage).await().messageId
+        val id = telegramClient.executeAsync(sendMessage).await().messageId
+        markerStore.write(cancelToken, JobMarkerStore.JobMarker(chatId, id, url, System.currentTimeMillis()))
+        return id
     }
 
     private suspend fun processCommands(update: Update, command: String) {

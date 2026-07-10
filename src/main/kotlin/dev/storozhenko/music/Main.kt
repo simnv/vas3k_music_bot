@@ -8,6 +8,7 @@ import org.telegram.telegrambots.meta.TelegramUrl
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient
 import org.telegram.telegrambots.longpolling.TelegramBotsLongPollingApplication
 import java.io.IOException
+import kotlinx.coroutines.runBlocking
 import okhttp3.Interceptor
 import okhttp3.Response
 
@@ -23,6 +24,7 @@ private val ipv6UrlContains = System.getenv()["IPV6_URL_CONTAINS"]?.takeIf(Strin
 private val chunkSizeMB = System.getenv()["CHUNK_SIZE_MB"]?.takeIf(String::isNotBlank)?.toIntOrNull() ?: 50
 private val ytdlProxy = System.getenv()["YTDL_PROXY"]?.takeIf(String::isNotBlank)
 private val ytdlProxyUrlContains = System.getenv()["YTDL_PROXY_URL_CONTAINS"]?.takeIf(String::isNotBlank)
+private val jobMarkerDir = System.getenv()["JOB_MARKER_DIR"]?.takeIf(String::isNotBlank) ?: "/data/jobs"
 
 class RetryInterceptor(private val maxRetries: Int) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -81,7 +83,19 @@ fun main() {
         .addInterceptor(RetryInterceptor(maxRetries = 5))
         .build()
     val telegramClient = OkHttpTelegramClient(httpClient, botToken, telegramURL)
-    val bot = Bot(botUsername, ytdlLocation, telegramClient, telegramAllowList, errorNotificationTelegramId, ipv6UrlContains, chunkSizeMB, ytdlProxy, ytdlProxyUrlContains)
+    val bot = Bot(
+        botName = botUsername,
+        ytdlLocation = ytdlLocation,
+        telegramClient = telegramClient,
+        telegramAllowList = telegramAllowList,
+        errorNotificationTelegramId = errorNotificationTelegramId,
+        ipv6UrlContains = ipv6UrlContains,
+        chunkSizeMB = chunkSizeMB,
+        ytdlProxy = ytdlProxy,
+        ytdlProxyUrlContains = ytdlProxyUrlContains,
+        jobMarkerDir = jobMarkerDir,
+    )
+    runBlocking { bot.sweepOrphans() }
     try {
         telegramBotsApi.registerBot(botToken, bot)
     } catch (e: Exception) {
