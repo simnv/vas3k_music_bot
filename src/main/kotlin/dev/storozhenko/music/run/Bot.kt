@@ -1,6 +1,5 @@
 package dev.storozhenko.music.run
 
-import dev.storozhenko.music.OdesilResponse
 import dev.storozhenko.music.Quality
 import dev.storozhenko.music.RequestOptions
 import dev.storozhenko.music.eagerlyDelete
@@ -12,8 +11,8 @@ import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.MediaProbeService
 import dev.storozhenko.music.services.MediaProcessingService
 import dev.storozhenko.music.services.MusicSearchService
+import dev.storozhenko.music.services.LinkMessageBuilder
 import dev.storozhenko.music.services.OdesilService
-import dev.storozhenko.music.services.VideoMeta
 import dev.storozhenko.music.services.TelegramSender
 import dev.storozhenko.music.services.UrlValidator
 import dev.storozhenko.music.split2ByDash
@@ -47,11 +46,9 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKe
 import org.telegram.telegrambots.meta.generics.TelegramClient
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 import java.io.File
-import java.net.URI
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import org.jsoup.Jsoup
 
 class Bot(
     private val botName: String,
@@ -69,6 +66,7 @@ class Bot(
     private val musicSearchService = MusicSearchService()
     private val odesilService = OdesilService(musicSearchService)
     private val urlValidator = UrlValidator()
+    private val linkBuilder = LinkMessageBuilder()
     private val downloader: DownloadService
     private val probe: MediaProbeService
     private val processor: MediaProcessingService
@@ -206,7 +204,7 @@ class Bot(
             coroutine.async { downloader.download("${UUID.randomUUID()}.%(ext)s", url, *flags.toTypedArray()) }
         }
 
-        val isKnownMusic = validLinks.isNotEmpty() || urlEntities.any { isKnownOdesliMusicUrl(it.text) }
+        val isKnownMusic = validLinks.isNotEmpty() || urlEntities.any { linkBuilder.isKnownOdesliMusicUrl(it.text) }
         var pulser: TelegramSender.ChatActionPulser? = if (isKnownMusic) sender.startPulser(chatId, "typing") else null
         val cancelToken = UUID.randomUUID().toString()
         val originalChatTitle = update.message.chat.title ?: "Private Chat"
@@ -239,7 +237,7 @@ class Bot(
 
         // Now run Odesli enrichment in parallel with the prefetch download (and the visible placeholder).
         val odesilDetections = urlEntities.mapNotNull { odesilService.detect(it) }
-        val links = odesilDetections.map { mapOdesilResponse(it.odesilResponse) }
+        val links = odesilDetections.map { linkBuilder.mapOdesilResponse(it.odesilResponse) }
 
         if (links.isEmpty() && validLinks.isEmpty()) {
             logger.info("No links from Odesil or valid video services, returning")
@@ -259,7 +257,7 @@ class Bot(
         } else if (!validLinks.isEmpty()) {
             val validLink = validLinks.first()
             val meta = downloader.getVideoMeta(validLink.text)
-            val displayTitle = formatTitleWithDuration(meta)
+            val displayTitle = linkBuilder.formatTitleWithDuration(meta)
             val partial = "$displayTitle\n<a href=\"${validLink.text}\">${validLink.text}</a>"
 
             // Early flush: show title + source link as soon as getVideoMeta returns, BEFORE the
@@ -270,21 +268,21 @@ class Bot(
             }
 
             val isMusicChat = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true
-            val odesilFromTitle = if (isMusicChat && isVkOrRutube(validLink.text) && meta.title.isNotBlank()) {
-                val searchQuery = stripAnnotations(meta.title)
+            val odesilFromTitle = if (isMusicChat && linkBuilder.isVkOrRutube(validLink.text) && meta.title.isNotBlank()) {
+                val searchQuery = linkBuilder.stripAnnotations(meta.title)
                 downloader.ytSearchFirst(searchQuery, meta.durationSec)?.let { ytUrl ->
                     logger.info("VK/RuTube in music chat: probing Odesli via YT search '$ytUrl'")
                     odesilService.detect(ytUrl)
                 }
             } else null
             linksMessage = if (odesilFromTitle != null) {
-                mapOdesilResponse(odesilFromTitle) + "\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+                linkBuilder.mapOdesilResponse(odesilFromTitle) + "\n<a href=\"${validLink.text}\">${validLink.text}</a>"
             } else {
                 partial
             }
         }
 
-        val youtubeFromMessage = extractFirstUrlByText(linksMessage, "Youtube")
+        val youtubeFromMessage = linkBuilder.extractFirstUrlByText(linksMessage, "Youtube")
         val ytSearchUrl: String? = if (youtubeFromMessage == null && odesilDetections.isNotEmpty()) {
             val firstDetection = odesilDetections.first().odesilResponse
             val data = firstDetection.entitiesByUniqueId[firstDetection.entityUniqueId]
@@ -524,30 +522,6 @@ class Bot(
         telegramClient.executeAsync(SendMessage(update.message.chatId.toString(), helpMessage)).await()
     }
 
-    private val platformOrder = listOf(
-        "yandex" to "Yandex.Music",
-        "youtube" to "YouTube",
-        // "youtubeMusic" to "YouTube Music",
-        "appleMusic" to "Apple Music",
-        "itunes" to "iTunes",
-        "spotify" to "Spotify",
-        "google" to "Google",
-        "googleStore" to "Google Store",
-        "soundcloud" to "SoundCloud"
-    )
-
-    private fun mapOdesilResponse(odesilResponse: OdesilResponse): String {
-        val odesilEntityData = odesilResponse.entitiesByUniqueId[odesilResponse.entityUniqueId]
-        val title = odesilEntityData?.title ?: ""
-        val artistName = odesilEntityData?.artistName ?: ""
-        val platforms = platformOrder.mapNotNull { (platformId, platformName) ->
-            odesilResponse.linksByPlatform[platformId]?.let { platformData -> platformName to platformData }
-        }
-        val songName = "$artistName - $title\n"
-        return songName + platforms.joinToString(separator = " | ")
-        { (platformName, platformData) -> "<a href=\"${platformData.url}\">${platformName}</a>" }
-    }
-
     private fun getCommand(entities: List<MessageEntity>): String? {
         val entityText = entities.firstOrNull { entity -> entity.type == "bot_command" }?.text
         return if (entityText != null && (!entityText.contains("@") || entityText.contains(botName)))
@@ -561,21 +535,6 @@ class Bot(
         return this::class.java.classLoader.getResource(name)?.readText()
             ?: throw IllegalStateException("Resource $name is not found")
     }
-
-    private fun extractFirstUrlByText(html: String, linkText: String): String? {
-        val doc = Jsoup.parse(html)
-        val element = doc.select("a:containsOwn($linkText)").first()
-        return element?.attr("href")
-    }
-
-    private fun formatTitleWithDuration(meta: VideoMeta): String =
-        meta.durationSec?.let { "${meta.title} [%02d:%02d]".format(it / 60, it % 60) } ?: meta.title
-
-    private fun stripAnnotations(s: String): String =
-        s.replace(Regex("\\s*\\[[^\\]]*\\]"), "")
-            .replace(Regex("\\s*\\([^)]*\\)"), "")
-            .trim()
-            .replace(Regex("\\s+"), " ")
 
     private suspend fun awaitOrDownload(prefetchedUrl: String?, prefetchedDownload: Deferred<File?>?, url: String, flags: List<String>): File? {
         if (prefetchedDownload != null && prefetchedUrl == url) return prefetchedDownload.await()
@@ -595,33 +554,5 @@ class Bot(
         val row = InlineKeyboardRow().apply { add(button) }
         return InlineKeyboardMarkup.builder().keyboardRow(row).build()
     }
-
-    // Hosts where we know we'll do real work — either validLinks-downloadable (handled by
-    // UrlValidator) or Odesli-recognized music platforms. Used to gate the early "typing" pulser
-    // so random non-music URLs don't trigger a speculative chat-action.
-    private val odesliKnownHosts = setOf(
-        "music.youtube.com",
-        "music.yandex.ru", "music.yandex.com",
-        "music.apple.com", "itunes.apple.com",
-        "open.spotify.com",
-        "soundcloud.com",
-        "deezer.com",
-        "tidal.com",
-        "music.amazon.com", "amazon.com",
-        "pandora.com",
-    )
-
-    private fun isKnownOdesliMusicUrl(url: String): Boolean = runCatching {
-        val host = URI(url).host.lowercase()
-        odesliKnownHosts.any { host == it || host.endsWith(".$it") }
-    }.getOrDefault(false)
-
-    private fun isVkOrRutube(url: String): Boolean = runCatching {
-        val host = URI(url).host.lowercase()
-        host == "rutube.ru" || host.endsWith(".rutube.ru") ||
-            host == "vk.com" || host.endsWith(".vk.com") ||
-            host == "vk.ru" || host.endsWith(".vk.ru") ||
-            host == "vkvideo.ru" || host.endsWith(".vkvideo.ru")
-    }.getOrDefault(false)
 
 }
