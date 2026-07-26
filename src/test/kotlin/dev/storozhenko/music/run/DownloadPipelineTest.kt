@@ -172,10 +172,73 @@ class DownloadPipelineTest {
         val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
         coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
         every { downloader.resolveSiblingThumbnail(any()) } returns null
+        every { downloader.readCategories(any()) } returns listOf("Film & Animation")
         coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 640, height = 360, duration = 200)
         coEvery { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) } returns true
 
         assertTrue(pipeline.run(audioRequest().copy(forceAudio = false), pulser, null))
+
+        coVerify(exactly = 0) { probe.decideSendAsVideo(any(), any()) }
+    }
+
+    @Test
+    fun `a Music category triggers detection on a plain youtube link outside a music chat`(@TempDir dir: File) = runTest {
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        val extracted = File(dir, "clip.m4a").apply { writeText("audio-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        every { downloader.readCategories(any()) } returns listOf("Music")
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 1920, height = 1080, duration = 183)
+        coEvery { probe.decideSendAsVideo(any(), any()) } returns false // still image with audio
+        coEvery { processor.convertToTelegramAudio(any()) } returns extracted
+
+        val req = audioRequest().copy(forceAudio = false, isMusicChat = false, isMusicSource = false)
+        assertTrue(pipeline.run(req, pulser, null))
+
+        coVerify(exactly = 1) { probe.decideSendAsVideo(eq(video), eq(183)) }
+        coVerify(exactly = 1) { sender.sendAudioInPlace(eq(extracted), any(), any(), any(), any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a Music category that is a real video still sends video`(@TempDir dir: File) = runTest {
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        every { downloader.readCategories(any()) } returns listOf("Music")
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 1920, height = 1080, duration = 183)
+        coEvery { probe.decideSendAsVideo(any(), any()) } returns true
+        coEvery { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) } returns true
+
+        assertTrue(pipeline.run(audioRequest().copy(forceAudio = false), pulser, null))
+
+        coVerify(exactly = 1) { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) }
+    }
+
+    @Test
+    fun `unknown categories do not trigger detection`(@TempDir dir: File) = runTest {
+        // An absent or unreadable sidecar must mean "unknown", never "music".
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        every { downloader.readCategories(any()) } returns emptyList()
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 640, height = 360, duration = 200)
+        coEvery { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) } returns true
+
+        assertTrue(pipeline.run(audioRequest().copy(forceAudio = false), pulser, null))
+
+        coVerify(exactly = 0) { probe.decideSendAsVideo(any(), any()) }
+    }
+
+    @Test
+    fun `explicit video beats a Music category`(@TempDir dir: File) = runTest {
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        every { downloader.readCategories(any()) } returns listOf("Music")
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 1920, height = 1080, duration = 183)
+        coEvery { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) } returns true
+
+        assertTrue(pipeline.run(audioRequest().copy(forceAudio = false, forceVideo = true), pulser, null))
 
         coVerify(exactly = 0) { probe.decideSendAsVideo(any(), any()) }
     }

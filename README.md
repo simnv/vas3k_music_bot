@@ -331,10 +331,14 @@ With no keyword, the source host decides:
 | --- | --- |
 | Spotify, Apple Music, iTunes, Yandex Music, SoundCloud, Deezer, Tidal, Amazon Music, Pandora | **Audio.** Not directly downloadable, so the link is resolved through Odesli and then `ytsearch` — the YouTube video we land on is incidental, and the user asked for a song. |
 | `music.youtube.com` | **Auto-detected.** We download the exact URL posted, which may be a static art track or a real music video, so `decideSendAsVideo` samples scene changes and freeze ratio. |
-| YouTube, `youtu.be`, TikTok, VK, RuTube | **Video.** |
+| YouTube, `youtu.be`, TikTok, VK, RuTube with YouTube category `Music` | **Auto-detected.** A song is often uploaded to an ordinary channel as a still image with audio — 16:9, so neither the host nor the aspect ratio gives it away. The category from `--write-info-json` does, at no extra network cost. |
+| Everything else | **Video.** |
 
 One exception applies on top of the table: in a chat whose playlist name contains `music`, *any*
-source is auto-detected, as it was before this change. `video` suppresses that too.
+source is auto-detected, as it was before this change. `video` suppresses all detection.
+
+Detection is deliberately keyed on the `Music` category rather than run on everything, so a
+static-camera clip in a cinema or photo chat still arrives as video.
 
 Precedence, highest first: `audio` → `video` → an explicit quality word (overrides the music-host audio default only) → the table above.
 

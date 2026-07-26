@@ -150,7 +150,14 @@ class DownloadPipeline(
 
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
             var sendVideo = true
-            val idHasMusic = (request.isMusicChat || request.isMusicSource) && !request.forceVideo
+            // A song can hide behind a plain youtube.com link: a still image with audio on an
+            // ordinary channel, 16:9 and so indistinguishable by host or aspect ratio. YouTube's own
+            // category is the cheap signal, and it leaves static-camera clips in cinema/photo chats
+            // on the video path because their category isn't Music.
+            val idHasMusic = !request.forceVideo && (
+                request.isMusicChat || request.isMusicSource ||
+                    downloader.readCategories(downloadedFile).any { it.equals("Music", ignoreCase = true) }
+                )
 
             if (fileSizeInMB > chunkSizeMB) {
                 reporter.status("Splitting video into chunks...")
@@ -237,7 +244,8 @@ class DownloadPipeline(
             reporter.fail("Failed to process video: ${e.message}")
             return false
         } finally {
-            val files = (chunkFiles + listOfNotNull(downloadedFile, thumbnailFile, telegramAudioFile)).toTypedArray()
+            val infoJson = downloadedFile?.let { downloader.resolveSiblingInfoJson(it) }
+            val files = (chunkFiles + listOfNotNull(downloadedFile, thumbnailFile, telegramAudioFile, infoJson)).toTypedArray()
             eagerlyDelete(logger, *files)
         }
     }
