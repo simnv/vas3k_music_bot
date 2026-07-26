@@ -308,8 +308,8 @@ mvn package -DskipTests
 Send a supported link in an authorized chat. Optionally add a quality keyword anywhere in the message:
 
 - `low` / `l` — up to 480p
-- `medium` / `med` / `mid` / `m` — up to 720p (default)
-- `high` / `hi` / `h` — best available
+- `medium` / `med` / `mid` / `m` — up to 720p
+- `high` / `hi` / `h` — best available (default)
 
 Single-letter aliases (`l`/`m`/`h`) are only recognized at the start or end of the message.
 
@@ -317,6 +317,26 @@ Force audio-only delivery (skip video analysis) with any of:
 
 - `audio` / `au` / `sound` / `snd`
 - `a` / `s` (only at the start or end of the message)
+
+Force video, skipping auto-detection, with any of:
+
+- `video` / `vid`
+- `v` (only at the start or end of the message)
+
+### How audio vs video is chosen
+
+With no keyword, the source host decides:
+
+| Source | Delivery |
+| --- | --- |
+| Spotify, Apple Music, iTunes, Yandex Music, SoundCloud, Deezer, Tidal, Amazon Music, Pandora | **Audio.** Not directly downloadable, so the link is resolved through Odesli and then `ytsearch` — the YouTube video we land on is incidental, and the user asked for a song. |
+| `music.youtube.com` | **Auto-detected.** We download the exact URL posted, which may be a static art track or a real music video, so `decideSendAsVideo` samples scene changes and freeze ratio. |
+| YouTube, `youtu.be`, TikTok, VK, RuTube | **Video.** |
+
+One exception applies on top of the table: in a chat whose playlist name contains `music`, *any*
+source is auto-detected, as it was before this change. `video` suppresses that too.
+
+Precedence, highest first: `audio` → `video` → an explicit quality word (overrides the music-host audio default only) → the table above.
 
 ## Supported Platforms
 

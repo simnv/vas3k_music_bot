@@ -45,6 +45,65 @@ class UtilsTest {
         assertEquals(RequestOptions(Quality.HIGH, false), parseRequestOptions(""))
     }
 
+    @Test
+    fun `video keywords force video`() {
+        assertTrue(parseRequestOptions("https://open.spotify.com/track/x video").forceVideo)
+        assertTrue(parseRequestOptions("vid https://open.spotify.com/track/x").forceVideo)
+        assertTrue(parseRequestOptions("https://open.spotify.com/track/x v").forceVideo)
+        assertTrue(parseRequestOptions("v https://open.spotify.com/track/x").forceVideo)
+    }
+
+    @Test
+    fun `single letter v only at message boundaries`() {
+        assertFalse(parseRequestOptions("watch v this https://open.spotify.com/track/x").forceVideo)
+    }
+
+    @Test
+    fun `no video keyword means no forceVideo`() {
+        assertFalse(parseRequestOptions("https://open.spotify.com/track/x").forceVideo)
+        assertFalse(parseRequestOptions("https://open.spotify.com/track/x audio").forceVideo)
+    }
+
+    @Test
+    fun `qualityExplicit tracks whether a quality word was typed`() {
+        assertFalse(parseRequestOptions("https://youtu.be/x").qualityExplicit)
+        // HIGH is the default, so only an explicit token distinguishes it
+        assertTrue(parseRequestOptions("https://youtu.be/x high").qualityExplicit)
+        assertTrue(parseRequestOptions("https://youtu.be/x low").qualityExplicit)
+        assertTrue(parseRequestOptions("m https://youtu.be/x").qualityExplicit)
+        assertFalse(parseRequestOptions("watch h this https://youtu.be/x").qualityExplicit)
+    }
+
+    // shouldForceAudio precedence
+    @Test
+    fun `explicit audio wins over everything`() {
+        assertTrue(shouldForceAudio(parseRequestOptions("https://youtu.be/x audio"), musicOnlySource = false))
+        assertTrue(shouldForceAudio(parseRequestOptions("audio https://youtu.be/x high"), musicOnlySource = false))
+        assertTrue(shouldForceAudio(parseRequestOptions("audio https://youtu.be/x video"), musicOnlySource = true))
+    }
+
+    @Test
+    fun `explicit video overrides the music-host audio default`() {
+        assertFalse(shouldForceAudio(parseRequestOptions("https://open.spotify.com/track/x video"), musicOnlySource = true))
+    }
+
+    @Test
+    fun `explicit quality overrides the music-host audio default`() {
+        assertFalse(shouldForceAudio(parseRequestOptions("https://open.spotify.com/track/x high"), musicOnlySource = true))
+        assertFalse(shouldForceAudio(parseRequestOptions("low https://open.spotify.com/track/x"), musicOnlySource = true))
+    }
+
+    @Test
+    fun `music-only source defaults to audio`() {
+        assertTrue(shouldForceAudio(parseRequestOptions("https://open.spotify.com/track/x"), musicOnlySource = true))
+    }
+
+    @Test
+    fun `non music source defaults to video`() {
+        assertFalse(shouldForceAudio(parseRequestOptions("https://youtu.be/x"), musicOnlySource = false))
+        assertFalse(shouldForceAudio(parseRequestOptions("https://youtu.be/x high"), musicOnlySource = false))
+    }
+
     // split2ByDash
     @Test
     fun `splits artist and title on first dash`() {

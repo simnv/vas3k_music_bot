@@ -26,6 +26,11 @@ data class DownloadRequest(
     val quality: Quality,
     val forceAudio: Boolean,
     val isMusicChat: Boolean,
+    /** Source URL is a known music host we *can* download directly (music.youtube.com), so its
+     *  content is ambiguous — art track vs real music video — and earns the probe. */
+    val isMusicSource: Boolean = false,
+    /** Explicit `video` keyword: suppresses auto-detection entirely. */
+    val forceVideo: Boolean = false,
     val prefetchedUrl: String? = null,
     val prefetchedDownload: Deferred<File?>? = null,
 )
@@ -145,7 +150,7 @@ class DownloadPipeline(
 
             val (artist, title) = message.lineSequence().first().split2ByDash(true)
             var sendVideo = true
-            val idHasMusic = request.isMusicChat
+            val idHasMusic = (request.isMusicChat || request.isMusicSource) && !request.forceVideo
 
             if (fileSizeInMB > chunkSizeMB) {
                 reporter.status("Splitting video into chunks...")

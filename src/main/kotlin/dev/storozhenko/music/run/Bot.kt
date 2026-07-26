@@ -3,6 +3,7 @@ package dev.storozhenko.music.run
 import dev.storozhenko.music.RequestOptions
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.parseRequestOptions
+import dev.storozhenko.music.shouldForceAudio
 import dev.storozhenko.music.services.DownloadService
 import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.MediaProbeService
@@ -193,8 +194,12 @@ class Bot(
     private suspend fun handleUrlMessage(update: Update, urlEntities: List<MessageEntity>) {
         val chatId = update.message.chatId
         val validLinks = urlEntities.filter { entity -> urlValidator.isValidDownloadUrl(entity.text) }
-        val (quality, forceAudio) = parseRequestOptions(update.message.text)
+        val options = parseRequestOptions(update.message.text)
+        val quality = options.quality
         val prefetchUrl = validLinks.firstOrNull()?.text
+
+        val musicSource = linkBuilder.classifyMusicSource(urlEntities.map { it.text }, validLinks.map { it.text })
+        val forceAudio = shouldForceAudio(options, musicSource.musicOnly)
 
         val isKnownMusic = validLinks.isNotEmpty() || urlEntities.any { linkBuilder.isKnownOdesliMusicUrl(it.text) }
         var pulser: TelegramSender.ChatActionPulser? = if (isKnownMusic) sender.startPulser(chatId, "typing") else null
@@ -258,7 +263,11 @@ class Bot(
                 }
 
                 val message = resolution.message
-                val requestMode = if (forceAudio) "audio (forced)" else quality.label
+                val requestMode = when {
+                    options.forceAudio -> "audio (forced)"
+                    forceAudio -> "audio (music link)"
+                    else -> quality.label
+                }
 
                 logger.info("Sending message: $message")
                 val authorUsername = update.message.from?.userName
@@ -282,6 +291,8 @@ class Bot(
                         quality = quality,
                         forceAudio = forceAudio,
                         isMusicChat = chatsAndPlaylistNames[chatId]?.contains("music", ignoreCase = true) == true,
+                        isMusicSource = musicSource.detectable,
+                        forceVideo = options.forceVideo,
                         prefetchedUrl = prefetchUrl,
                         prefetchedDownload = prefetchedDownload,
                     ),

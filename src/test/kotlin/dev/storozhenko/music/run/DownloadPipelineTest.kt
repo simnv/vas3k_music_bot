@@ -117,6 +117,70 @@ class DownloadPipelineTest {
     }
 
     @Test
+    fun `music source runs detection outside a music chat and sends audio when static`(@TempDir dir: File) = runTest {
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        val extracted = File(dir, "clip.m4a").apply { writeText("audio-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 720, height = 720, duration = 200)
+        coEvery { probe.decideSendAsVideo(any(), any()) } returns false // art track
+        coEvery { processor.convertToTelegramAudio(any()) } returns extracted
+
+        val req = audioRequest().copy(forceAudio = false, isMusicChat = false, isMusicSource = true)
+        assertTrue(pipeline.run(req, pulser, null))
+
+        coVerify(exactly = 1) { probe.decideSendAsVideo(eq(video), eq(200)) }
+        coVerify(exactly = 1) { sender.sendAudioInPlace(eq(extracted), eq(5L), eq(42), any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { sender.sendVideoChunks(any(), any(), any(), any(), any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `music source sends video when detection finds real motion`(@TempDir dir: File) = runTest {
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 640, height = 360, duration = 200)
+        coEvery { probe.decideSendAsVideo(any(), any()) } returns true // real music video
+        coEvery { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) } returns true
+
+        val req = audioRequest().copy(forceAudio = false, isMusicChat = false, isMusicSource = true)
+        assertTrue(pipeline.run(req, pulser, null))
+
+        coVerify(exactly = 1) { probe.decideSendAsVideo(eq(video), eq(200)) }
+        coVerify(exactly = 1) { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) }
+    }
+
+    @Test
+    fun `explicit video suppresses detection even for a music source in a music chat`(@TempDir dir: File) = runTest {
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 720, height = 720, duration = 200)
+        coEvery { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) } returns true
+
+        val req = audioRequest().copy(
+            forceAudio = false, isMusicChat = true, isMusicSource = true, forceVideo = true,
+        )
+        assertTrue(pipeline.run(req, pulser, null))
+
+        coVerify(exactly = 0) { probe.decideSendAsVideo(any(), any()) }
+        coVerify(exactly = 1) { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) }
+    }
+
+    @Test
+    fun `plain video source never triggers detection`(@TempDir dir: File) = runTest {
+        val video = File(dir, "clip.mp4").apply { writeText("video-bytes") }
+        coEvery { downloader.download(any(), any(), *anyVararg()) } returns video
+        every { downloader.resolveSiblingThumbnail(any()) } returns null
+        coEvery { probe.getVideoDimensions(any()) } returns VideoDimensions(width = 640, height = 360, duration = 200)
+        coEvery { sender.sendVideoChunks(any(), any(), any(), any(), any(), isNull(), any(), isNull()) } returns true
+
+        assertTrue(pipeline.run(audioRequest().copy(forceAudio = false), pulser, null))
+
+        coVerify(exactly = 0) { probe.decideSendAsVideo(any(), any()) }
+    }
+
+    @Test
     fun `video path cancellation propagates without failure edit`() = runTest {
         coEvery { downloader.download(any(), any(), *anyVararg()) } coAnswers { awaitCancellation() }
         val job = launch { pipeline.run(audioRequest().copy(forceAudio = false), pulser, null) }

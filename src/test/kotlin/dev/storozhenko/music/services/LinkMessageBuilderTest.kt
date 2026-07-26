@@ -57,6 +57,70 @@ class LinkMessageBuilderTest {
     }
 
     @Test
+    fun `separates youtube music from plain youtube`() {
+        // music.youtube.com is the only known music host that is also directly downloadable, so it
+        // gets auto-detection while plain YouTube stays on the untouched video path.
+        assertTrue(builder.isKnownOdesliMusicUrl("https://music.youtube.com/watch?v=1"))
+        assertFalse(builder.isKnownOdesliMusicUrl("https://www.youtube.com/watch?v=1"))
+        assertFalse(builder.isKnownOdesliMusicUrl("https://youtu.be/1"))
+    }
+
+    private val spotify = "https://open.spotify.com/track/1"
+    private val ytMusic = "https://music.youtube.com/watch?v=1"
+    private val youtube = "https://www.youtube.com/watch?v=1"
+
+    @Test
+    fun `undownloadable music host is audio-only`() {
+        val c = builder.classifyMusicSource(listOf(spotify), downloadableUrls = emptyList())
+        assertTrue(c.musicOnly)
+        assertFalse(c.detectable)
+    }
+
+    @Test
+    fun `youtube music is detectable rather than audio-only`() {
+        // music.youtube.com is downloadable, so it is never musicOnly — the probe decides.
+        val c = builder.classifyMusicSource(listOf(ytMusic), downloadableUrls = listOf(ytMusic))
+        assertFalse(c.musicOnly)
+        assertTrue(c.detectable)
+    }
+
+    @Test
+    fun `plain youtube is neither`() {
+        val c = builder.classifyMusicSource(listOf(youtube), downloadableUrls = listOf(youtube))
+        assertFalse(c.musicOnly)
+        assertFalse(c.detectable)
+    }
+
+    @Test
+    fun `a downloadable link in the message suppresses the audio-only default`() {
+        // Mixed message: the YouTube link is what we actually download, so it also decides delivery.
+        val c = builder.classifyMusicSource(listOf(youtube, spotify), downloadableUrls = listOf(youtube))
+        assertFalse(c.musicOnly)
+        assertFalse(c.detectable)
+    }
+
+    @Test
+    fun `a music host anywhere in a message with no downloadable link is audio-only`() {
+        val c = builder.classifyMusicSource(listOf("https://example.com/post", spotify), downloadableUrls = emptyList())
+        assertTrue(c.musicOnly)
+    }
+
+    @Test
+    fun `detectability follows the first downloadable url, matching download precedence`() {
+        val c = builder.classifyMusicSource(listOf(youtube, ytMusic), downloadableUrls = listOf(youtube, ytMusic))
+        assertFalse(c.detectable)
+        val flipped = builder.classifyMusicSource(listOf(ytMusic, youtube), downloadableUrls = listOf(ytMusic, youtube))
+        assertTrue(flipped.detectable)
+    }
+
+    @Test
+    fun `no urls is neither`() {
+        val c = builder.classifyMusicSource(emptyList(), emptyList())
+        assertFalse(c.musicOnly)
+        assertFalse(c.detectable)
+    }
+
+    @Test
     fun `recognizes vk and rutube hosts`() {
         assertTrue(builder.isVkOrRutube("https://vk.com/video-1_2"))
         assertTrue(builder.isVkOrRutube("https://rutube.ru/video/x/"))

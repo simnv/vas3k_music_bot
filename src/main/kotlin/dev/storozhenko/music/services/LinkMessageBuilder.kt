@@ -64,6 +64,25 @@ class LinkMessageBuilder {
         odesliKnownHosts.any { host == it || host.endsWith(".$it") }
     }.getOrDefault(false)
 
+    /**
+     * How a message's URLs map onto the audio/video default.
+     *
+     * @param musicOnly a music host we can't download directly (Spotify, Apple, Deezer, ...). It is
+     *   resolved through Odesli and then `ytsearch`, so the YouTube video we land on is incidental
+     *   and the user asked for a song — send audio.
+     * @param detectable a music host we *can* download directly (`music.youtube.com`). We fetch the
+     *   exact URL posted, which may be a static art track or a real music video — let the probe decide.
+     */
+    data class MusicSource(val musicOnly: Boolean, val detectable: Boolean)
+
+    fun classifyMusicSource(allUrls: List<String>, downloadableUrls: List<String>): MusicSource =
+        MusicSource(
+            musicOnly = downloadableUrls.isEmpty() && allUrls.any { isKnownOdesliMusicUrl(it) },
+            // Mirrors the downloadUrl precedence in Bot: the first downloadable URL is the one we
+            // actually fetch, so it must also be the one we classify.
+            detectable = downloadableUrls.firstOrNull()?.let { isKnownOdesliMusicUrl(it) } == true,
+        )
+
     fun isVkOrRutube(url: String): Boolean = runCatching {
         val host = URI(url).host.lowercase()
         host == "rutube.ru" || host.endsWith(".rutube.ru") ||

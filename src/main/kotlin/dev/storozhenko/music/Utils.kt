@@ -41,7 +41,12 @@ enum class Quality(val label: String, val formatSelector: String) {
     HIGH("best", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best")
 }
 
-data class RequestOptions(val quality: Quality, val forceAudio: Boolean)
+data class RequestOptions(
+    val quality: Quality,
+    val forceAudio: Boolean,
+    val forceVideo: Boolean = false,
+    val qualityExplicit: Boolean = false,
+)
 
 fun parseRequestOptions(text: String): RequestOptions {
     val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
@@ -49,6 +54,7 @@ fun parseRequestOptions(text: String): RequestOptions {
     val lastIdx = tokens.size - 1
     var quality: Quality? = null
     var forceAudio = false
+    var forceVideo = false
     tokens.forEachIndexed { i, raw ->
         val tok = raw.lowercase()
         val atBoundary = i == 0 || i == lastIdx
@@ -67,8 +73,26 @@ fun parseRequestOptions(text: String): RequestOptions {
             forceAudio = tok == "audio" || tok == "au" || tok == "sound" || tok == "snd" ||
                 (atBoundary && (tok == "a" || tok == "s"))
         }
+        if (!forceVideo) {
+            forceVideo = tok == "video" || tok == "vid" || (atBoundary && tok == "v")
+        }
     }
-    return RequestOptions(quality ?: Quality.HIGH, forceAudio)
+    // `quality` defaults to HIGH when absent, so it can't tell "typed high" from "typed nothing".
+    return RequestOptions(quality ?: Quality.HIGH, forceAudio, forceVideo, qualityExplicit = quality != null)
+}
+
+/**
+ * Whether the request should be downloaded and sent as audio only.
+ *
+ * Precedence, highest first: explicit `audio` wins over everything; an explicit `video` or
+ * quality word overrides the music-host default; otherwise a music-service link that we can't
+ * download directly (Spotify, Apple, Deezer, ...) defaults to audio, because it is resolved
+ * through an incidental `ytsearch` hit that the user never pointed at.
+ */
+fun shouldForceAudio(options: RequestOptions, musicOnlySource: Boolean): Boolean = when {
+    options.forceAudio -> true
+    options.forceVideo || options.qualityExplicit -> false
+    else -> musicOnlySource
 }
 
 fun validateVideoFile(videoFile: File): Pair<Boolean, String> {
