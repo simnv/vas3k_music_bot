@@ -37,6 +37,7 @@ class MusicResolver(
     private val web: WebFetcher,
     private val ytSearch: suspend (String) -> String?,
     private val spotify: SpotifyClient? = null,
+    private val appleStorefront: String = "ru",
 ) {
     private val logger = getLogger()
     private val mapper = ObjectMapper()
@@ -169,10 +170,19 @@ class MusicResolver(
 
     // ---- stage 2: search ---------------------------------------------------
 
+    /**
+     * Apple has no storefront-neutral link — an URL without a country segment just 301s to `/us/`.
+     * Search the [appleStorefront] first so links open in the right store, and fall back to the
+     * default (US) catalogue only when that storefront does not carry the track.
+     */
     private suspend fun searchApple(query: String): String? {
-        val body = web.get("https://itunes.apple.com/search?term=${encode(query)}&entity=song&limit=1")
-            ?: return null
-        return parseItunesUrl(body)
+        val term = encode(query)
+        val local = web.get(
+            "https://itunes.apple.com/search?term=$term&entity=song&limit=1&country=$appleStorefront"
+        )?.let { parseItunesUrl(it) }
+        if (local != null) return local
+        return web.get("https://itunes.apple.com/search?term=$term&entity=song&limit=1")
+            ?.let { parseItunesUrl(it) }
     }
 
     /**

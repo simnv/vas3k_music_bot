@@ -68,6 +68,32 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `apple search prefers the configured storefront`() = runTest {
+        val source = "https://music.yandex.ru/album/43183857/track/153933899"
+        val ruJson = itunesJson.replace("/us/", "/ru/")
+        coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
+        coEvery { web.get(match { it.contains("country=ru") }, any(), any()) } returns ruJson
+
+        val r = MusicResolver(web, ytSearch = { null }).resolve(source)!!
+        assertTrue(r.links["Apple Music"]!!.contains("/ru/"), "expected a ru storefront link")
+    }
+
+    @Test
+    fun `apple search falls back when the storefront lacks the track`() = runTest {
+        val source = "https://music.yandex.ru/album/43183857/track/153933899"
+        coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
+        // Storefront miss, then the default catalogue answers.
+        coEvery { web.get(match { it.contains("country=ru") }, any(), any()) } returns
+            """{"resultCount":0,"results":[]}"""
+        coEvery {
+            web.get(match { it.startsWith("https://itunes.apple.com/search") && !it.contains("country=") }, any(), any())
+        } returns itunesJson
+
+        val r = MusicResolver(web, ytSearch = { null }).resolve(source)!!
+        assertTrue(r.links["Apple Music"]!!.contains("/us/"))
+    }
+
+    @Test
     fun `extracts the yandex track id`() {
         assertEquals("153933899", resolver.yandexTrackId("https://music.yandex.ru/album/43183857/track/153933899"))
         assertNull(resolver.yandexTrackId("https://music.yandex.ru/album/43183857"))
