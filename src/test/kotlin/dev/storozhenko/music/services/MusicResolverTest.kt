@@ -58,6 +58,16 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `parses the array-shaped track response the api actually returns`() {
+        // /tracks/{id} wraps the track in an array; the object form only shows up elsewhere.
+        val arrayShaped = """
+            {"result":[{"id":"153933899","title":"Владивосток","artists":[{"name":"BEARWOLF"}]}]}
+        """.trimIndent()
+        assertEquals(TrackIdentity("BEARWOLF", "Владивосток"), resolver.parseYandexTrack(arrayShaped))
+        assertNull(resolver.parseYandexTrack("""{"result":[]}"""))
+    }
+
+    @Test
     fun `extracts the yandex track id`() {
         assertEquals("153933899", resolver.yandexTrackId("https://music.yandex.ru/album/43183857/track/153933899"))
         assertNull(resolver.yandexTrackId("https://music.yandex.ru/album/43183857"))
