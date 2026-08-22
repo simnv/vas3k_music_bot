@@ -29,6 +29,25 @@ class LinkMessageBuilder {
         { (platformName, platformData) -> "<a href=\"${platformData.url}\">${platformName}</a>" }
     }
 
+    /**
+     * Renders a [ResolvedTrack] in the same shape as the Odesli message: "Artist - Title" then the
+     * platform links. Artist/title come from scraped pages and third-party APIs, so they are
+     * escaped — an apostrophe or ampersand in a track name would otherwise break Telegram's HTML
+     * parse mode and drop the whole message.
+     */
+    fun formatResolved(track: ResolvedTrack): String {
+        val name = listOf(track.identity.artist, track.identity.title)
+            .filter { it.isNotBlank() }
+            .joinToString(" - ")
+        val links = track.links.entries.joinToString(" | ") { (platform, url) ->
+            "<a href=\"${escapeHtml(url)}\">${escapeHtml(platform)}</a>"
+        }
+        return "${escapeHtml(name)}\n$links"
+    }
+
+    internal fun escapeHtml(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
     fun extractFirstUrlByText(html: String, linkText: String): String? {
         val doc = Jsoup.parse(html)
         val element = doc.select("a:containsOwn($linkText)").first()

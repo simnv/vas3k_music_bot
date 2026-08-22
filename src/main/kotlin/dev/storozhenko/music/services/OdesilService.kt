@@ -13,20 +13,35 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.Charset
 
-class OdesilService(private val musicSearch: MusicSearchService? = null) {
+/**
+ * Songlink/Odesli lookup.
+ *
+ * The keyless tier was withdrawn — unauthenticated requests now return
+ * `401 PUBLIC_API_ACCESS_DEPRECATED` — so this is disabled unless [apiKey] is configured. Odesli's
+ * own docs still describe auth as optional; they are out of date. Request a key from
+ * developers@song.link and set ODESLI_API_KEY to re-enable it.
+ */
+class OdesilService(
+    private val musicSearch: MusicSearchService? = null,
+    private val apiKey: String? = null,
+) {
     private val logger = getLogger()
     private val client = HttpClient.newBuilder().build()
     private val objectMapper = ObjectMapper().apply {
         configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
     }
 
+    val enabled: Boolean get() = !apiKey.isNullOrBlank()
+
     suspend fun detect(messageEntity: MessageEntity): OdesilEntity? =
         detect(messageEntity.text)?.let { OdesilEntity(it, messageEntity) }
 
     suspend fun detect(url: String): OdesilResponse? {
+        if (!enabled) return null
         val encodedUrl = URLEncoder.encode(url.substringBefore("?list="), Charset.defaultCharset())
+        val keyParam = "&key=" + URLEncoder.encode(apiKey, Charset.defaultCharset())
         val request = HttpRequest.newBuilder()
-            .uri(URI.create("https://api.song.link/v1-alpha.1/links?url=$encodedUrl"))
+            .uri(URI.create("https://api.song.link/v1-alpha.1/links?url=$encodedUrl$keyParam"))
             .build()
         val response = retryRequest(request) ?: return null
         val body = response.body()

@@ -27,6 +27,11 @@ private val ytdlProxyUrlContains = System.getenv()["YTDL_PROXY_URL_CONTAINS"]?.t
 private val jobMarkerDir = System.getenv()["JOB_MARKER_DIR"]?.takeIf(String::isNotBlank) ?: "/data/jobs"
 private val maxConcurrentDownloads = System.getenv()["MAX_CONCURRENT_DOWNLOADS"]?.takeIf(String::isNotBlank)?.toIntOrNull() ?: 32
 private val maxConcurrentDownloadsPerChat = System.getenv()["MAX_CONCURRENT_DOWNLOADS_PER_CHAT"]?.takeIf(String::isNotBlank)?.toIntOrNull() ?: 2
+// Odesli's keyless tier is gone (401 PUBLIC_API_ACCESS_DEPRECATED); without a key the bot resolves
+// links itself. Request one from developers@song.link to re-enable Odesli.
+private val odesliApiKey = System.getenv()["ODESLI_API_KEY"]?.takeIf(String::isNotBlank)
+private val spotifyClientId = System.getenv()["SPOTIFY_CLIENT_ID"]?.takeIf(String::isNotBlank)
+private val spotifyClientSecret = System.getenv()["SPOTIFY_CLIENT_SECRET"]?.takeIf(String::isNotBlank)
 
 class RetryInterceptor(private val maxRetries: Int) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -98,6 +103,9 @@ fun main() {
         jobMarkerDir = jobMarkerDir,
         maxConcurrentDownloads = maxConcurrentDownloads,
         maxConcurrentDownloadsPerChat = maxConcurrentDownloadsPerChat,
+        odesliApiKey = odesliApiKey,
+        spotifyClientId = spotifyClientId,
+        spotifyClientSecret = spotifyClientSecret,
     )
     runBlocking { bot.sweepOrphans() }
     try {

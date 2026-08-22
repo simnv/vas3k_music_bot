@@ -33,6 +33,10 @@ services:
       - JOB_MARKER_DIR
       - MAX_CONCURRENT_DOWNLOADS
       - MAX_CONCURRENT_DOWNLOADS_PER_CHAT
+      # All optional. Without them the bot resolves music links itself.
+      - ODESLI_API_KEY
+      - SPOTIFY_CLIENT_ID
+      - SPOTIFY_CLIENT_SECRET
     depends_on:
       - tgbot-api
     networks:

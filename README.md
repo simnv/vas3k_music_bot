@@ -344,13 +344,28 @@ Precedence, highest first: `audio` → `video` → an explicit quality word (ove
 
 ## Supported Platforms
 
-### Music Link Parsing (via Odesli)
-- Spotify
-- YouTube / YouTube Music
-- Apple Music / iTunes
-- Yandex Music
-- SoundCloud
-- Google Play Music
+### Music Link Parsing
+
+Odesli's keyless API tier was withdrawn — it now answers
+`401 PUBLIC_API_ACCESS_DEPRECATED` — so the bot resolves links itself by default. It reads the
+artist and title from the posted link, then looks the track up on each service:
+
+| Service | How | Needs credentials |
+| --- | --- | --- |
+| Yandex Music | `music.yandex.ru/search` page, first track hit | no |
+| Apple Music / iTunes | `itunes.apple.com` search and lookup | no |
+| YouTube | `yt-dlp ytsearch` | no |
+| Spotify | Web API, client-credentials flow | **yes** |
+
+The posted link is reused for its own service instead of being searched for again.
+
+Optional environment variables:
+
+- `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — enable Spotify links. Spotify pages are
+  JS-rendered with no `og:` tags, and its oEmbed gives no artist, so there is no keyless path.
+  Omitted entirely when unset.
+- `ODESLI_API_KEY` — re-enable Odesli, which is used in preference when set. Request a key from
+  `developers@song.link`. Odesli's own docs still describe auth as optional; they are out of date.
 
 ### Video/Audio Download
 - YouTube (`youtube.com`, `youtu.be`)

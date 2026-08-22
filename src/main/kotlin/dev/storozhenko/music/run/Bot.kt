@@ -8,7 +8,10 @@ import dev.storozhenko.music.services.DownloadService
 import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.MediaProbeService
 import dev.storozhenko.music.services.MediaProcessingService
+import dev.storozhenko.music.services.MusicResolver
 import dev.storozhenko.music.services.MusicSearchService
+import dev.storozhenko.music.services.SpotifyClient
+import dev.storozhenko.music.services.WebFetcher
 import dev.storozhenko.music.services.LinkMessageBuilder
 import dev.storozhenko.music.services.OdesilService
 import dev.storozhenko.music.services.TelegramSender
@@ -53,11 +56,14 @@ class Bot(
     private val jobMarkerDir: String = "/data/jobs",
     private val maxConcurrentDownloads: Int = 32,
     private val maxConcurrentDownloadsPerChat: Int = 2,
+    private val odesliApiKey: String? = null,
+    private val spotifyClientId: String? = null,
+    private val spotifyClientSecret: String? = null,
 ) : LongPollingUpdateConsumer {
     private val logger = getLogger()
     private val errorNotificationService = errorNotificationTelegramId?.let { ErrorNotificationService(telegramClient, it) }
     private val musicSearchService = MusicSearchService()
-    private val odesilService = OdesilService(musicSearchService)
+    private val odesilService = OdesilService(musicSearchService, odesliApiKey)
     private val urlValidator = UrlValidator()
     private val linkBuilder = LinkMessageBuilder()
     private val downloader: DownloadService
@@ -65,6 +71,7 @@ class Bot(
     private val processor: MediaProcessingService
     private val sender: TelegramSender
     private val pipeline: DownloadPipeline
+    private val musicResolver: MusicResolver
     val handler = CoroutineExceptionHandler { _, exception ->
         logger.error("Caught exception: $exception")
         errorNotificationService?.sendErrorNotification(exception)
@@ -92,6 +99,18 @@ class Bot(
         processor = MediaProcessingService(virtualDispatcher, fileDeleteScope, chunkSizeMB, errorNotificationService)
         sender = TelegramSender(telegramClient, coroutine)
         pipeline = DownloadPipeline(downloader, probe, processor, sender, chunkSizeMB)
+        val spotify = if (!spotifyClientId.isNullOrBlank() && !spotifyClientSecret.isNullOrBlank()) {
+            SpotifyClient(spotifyClientId, spotifyClientSecret, virtualDispatcher)
+        } else {
+            logger.info("Spotify credentials not configured — Spotify links will be omitted")
+            null
+        }
+        musicResolver = MusicResolver(
+            web = WebFetcher(virtualDispatcher),
+            ytSearch = { query -> downloader.ytSearchFirst(query) },
+            spotify = spotify,
+        )
+        logger.info("Odesli ${if (odesilService.enabled) "enabled" else "disabled (no ODESLI_API_KEY)"}")
     }
 
     private val orphanSweeper = OrphanSweeper(markerStore, sender)
@@ -258,7 +277,14 @@ class Bot(
                         runCatching { sender.editMessageText(chatId, id, "$partial\nDownloading...", cancelKb) }
                     }
                 } ?: run {
-                    logger.info("No links from Odesil or valid video services, returning")
+                    logger.info("Could not resolve any link in the message")
+                    // Previously this returned silently, so a user whose music link failed to
+                    // resolve saw no reply at all and could not tell the bot had even seen it.
+                    if (isKnownMusic) {
+                        val text = "❌ Не удалось найти этот трек."
+                        tmId?.let { id -> runCatching { sender.editMessageText(chatId, id, text, null) } }
+                            ?: runCatching { sendStatusMessage(chatId, text, replyToMessageId, cancelKb, cancelToken, originalUrl) }
+                    }
                     return@withSlot
                 }
 
@@ -326,14 +352,24 @@ class Bot(
         val odesilDetections = urlEntities.mapNotNull { odesilService.detect(it) }
         val links = odesilDetections.map { linkBuilder.mapOdesilResponse(it.odesilResponse) }
 
-        if (links.isEmpty() && validLinks.isEmpty()) {
+        // Odesli is off (no API key) or matched nothing: resolve the music hosts ourselves.
+        var resolverYoutubeUrl: String? = null
+        val resolved = if (links.isEmpty()) {
+            urlEntities.filter { linkBuilder.isKnownOdesliMusicUrl(it.text) }
+                .firstNotNullOfOrNull { entity -> musicResolver.resolve(entity.text) }
+                ?.also { resolverYoutubeUrl = it.youtubeUrl }
+        } else null
+
+        if (links.isEmpty() && resolved == null && validLinks.isEmpty()) {
             return null
         }
 
         onDetected()
 
         lateinit var linksMessage: String
-        if (!links.isEmpty()) {
+        if (resolved != null) {
+            linksMessage = linkBuilder.formatResolved(resolved)
+        } else if (!links.isEmpty()) {
             linksMessage = if (links.size == 1) {
                 links.first()
             } else {
@@ -380,7 +416,9 @@ class Bot(
             linksMessage = if (parts.size == 2) "${parts[0]}\n$ytLink | ${parts[1]}" else "$linksMessage\n$ytLink"
         }
 
-        return LinkResolution("$linksMessage", youtubeFromMessage ?: ytSearchUrl)
+        // Prefer the resolver's structured URL: parsing it back out of the rendered HTML is what
+        // the Odesli path did, and it couples the download target to message formatting.
+        return LinkResolution("$linksMessage", resolverYoutubeUrl ?: youtubeFromMessage ?: ytSearchUrl)
     }
 
     private suspend fun sendStatusMessage(

@@ -121,6 +121,36 @@ class LinkMessageBuilderTest {
     }
 
     @Test
+    fun `formats a resolved track with escaped metadata`() {
+        val track = ResolvedTrack(
+            identity = TrackIdentity("AC/DC & Co", "Rock <n> Roll"),
+            links = linkedMapOf("Yandex.Music" to "https://music.yandex.ru/album/1/track/2"),
+            youtubeUrl = null,
+        )
+        val out = builder.formatResolved(track)
+        // Unescaped & or < would break Telegram HTML parse mode and drop the whole message.
+        assertEquals("AC/DC &amp; Co - Rock &lt;n&gt; Roll", out.lineSequence().first())
+        assertTrue(out.contains("""<a href="https://music.yandex.ru/album/1/track/2">Yandex.Music</a>"""))
+    }
+
+    @Test
+    fun `escapes ampersands inside link urls`() {
+        // iTunes trackViewUrl carries &uo=4, which must not terminate the href attribute early.
+        val track = ResolvedTrack(
+            TrackIdentity("A", "B"),
+            linkedMapOf("Apple Music" to "https://music.apple.com/x?i=1&uo=4"),
+            null,
+        )
+        assertTrue(builder.formatResolved(track).contains("i=1&amp;uo=4"))
+    }
+
+    @Test
+    fun `omits a blank artist from the title line`() {
+        val track = ResolvedTrack(TrackIdentity("", "Solo"), linkedMapOf("YouTube" to "https://y/1"), null)
+        assertEquals("Solo", builder.formatResolved(track).lineSequence().first())
+    }
+
+    @Test
     fun `recognizes vk and rutube hosts`() {
         assertTrue(builder.isVkOrRutube("https://vk.com/video-1_2"))
         assertTrue(builder.isVkOrRutube("https://rutube.ru/video/x/"))
