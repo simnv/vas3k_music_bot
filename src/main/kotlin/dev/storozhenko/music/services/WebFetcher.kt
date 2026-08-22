@@ -27,6 +27,9 @@ class WebFetcher(
     private val direct = OkHttpClient.Builder()
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS)
+        // Whole-call deadline. Without it a response that trickles in under the read timeout could
+        // hold a download admission slot indefinitely.
+        .callTimeout(15, TimeUnit.SECONDS)
         .build()
 
     /** Null when no proxy is configured; callers then fall back to a direct request. */
@@ -60,6 +63,11 @@ class WebFetcher(
         headers: Map<String, String> = emptyMap(),
         useProxy: Boolean = false,
     ): String? = runInterruptible(virtualDispatcher) {
+        if (useProxy && proxied == null) {
+            // Going direct here is not a soft degradation: Yandex answers this host with 451, so the
+            // lookup is certain to fail and the user just sees "track not found".
+            logger.warn("$url needs the SOCKS proxy but none is configured (set YTDL_PROXY); it will likely fail")
+        }
         val client = if (useProxy) proxied ?: direct else direct
         try {
             val builder = Request.Builder().url(url)

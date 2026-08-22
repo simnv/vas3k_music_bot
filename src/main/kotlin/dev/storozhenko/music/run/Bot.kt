@@ -356,7 +356,10 @@ class Bot(
 
         // Odesli is off (no API key) or matched nothing: resolve the music hosts ourselves.
         var resolverYoutubeUrl: String? = null
-        val resolved = if (links.isEmpty()) {
+        // Requires validLinks to be empty, not just no Odesli hit: with both a YouTube link and a
+        // Spotify link in one message we download validLinks[0], so describing the Spotify track
+        // instead would caption the file with a different song.
+        val resolved = if (links.isEmpty() && validLinks.isEmpty()) {
             // Only hosts we cannot download directly. A downloadable one (music.youtube.com) already
             // has its own path below, which reuses the posted URL and its yt-dlp metadata.
             urlEntities.filter { linkBuilder.isKnownOdesliMusicUrl(it.text) && !urlValidator.isValidDownloadUrl(it.text) }
