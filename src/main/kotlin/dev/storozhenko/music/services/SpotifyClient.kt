@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import dev.storozhenko.music.getLogger
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -29,14 +31,26 @@ class SpotifyClient(
     private val mapper = ObjectMapper()
     private val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(6)).build()
 
-    @Volatile
-    private var token: String? = null
+    /** Token and its expiry as one immutable snapshot: two independent volatiles could pair an old
+     *  token with a newly written expiry and hand back a credential that has already expired. */
+    private data class CachedToken(val value: String, val expiry: Instant)
 
     @Volatile
-    private var tokenExpiry: Instant = Instant.EPOCH
+    private var cached: CachedToken? = null
+
+    /** Serialises refresh so an expiry does not send all concurrent requests to Spotify at once. */
+    private val refreshLock = Mutex()
 
     private suspend fun accessToken(now: Instant): String? {
-        token?.let { if (now.isBefore(tokenExpiry)) return it }
+        cached?.let { if (now.isBefore(it.expiry)) return it.value }
+        return refreshLock.withLock {
+            // Re-check: another coroutine may have refreshed while we waited for the lock.
+            cached?.let { if (now.isBefore(it.expiry)) return@withLock it.value }
+            fetchToken(now)
+        }
+    }
+
+    private suspend fun fetchToken(now: Instant): String? {
         return runInterruptible(virtualDispatcher) {
             runCatching {
                 val basic = Base64.getEncoder()
@@ -57,10 +71,10 @@ class SpotifyClient(
                 val value = node.path("access_token").asText("").takeIf { it.isNotBlank() }
                     ?: return@runCatching null
                 // Renew a minute early so a token can't expire mid-request.
-                tokenExpiry = now.plusSeconds(node.path("expires_in").asLong(3600) - 60)
-                token = value
+                cached = CachedToken(value, now.plusSeconds(node.path("expires_in").asLong(3600) - 60))
                 value
             }.getOrElse {
+                if (it is InterruptedException) throw it
                 logger.info("Spotify token request failed: ${it.message}")
                 null
             }
@@ -84,6 +98,7 @@ class SpotifyClient(
                     response.body()
                 }
             }.getOrElse {
+                if (it is InterruptedException) throw it
                 logger.info("Spotify GET $path failed: ${it.message}")
                 null
             }

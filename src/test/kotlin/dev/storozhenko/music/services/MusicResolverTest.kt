@@ -5,6 +5,7 @@ import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -110,6 +111,74 @@ class MusicResolverTest {
         coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any()) } returns null
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/abc" }, spotify = null).resolve(source)!!
         assertTrue(!r.links.containsKey("Spotify"))
+    }
+
+    @Test
+    fun `og parsing survives apostrophes and decodes entities`() {
+        // A regex capture of [^"']* truncates this at the apostrophe, yielding "Don".
+        val html = """<meta property="og:title" content="Don't Stop">"""
+        assertEquals("Don't Stop", resolver.parseOg(html)?.title)
+
+        val entities = """<meta property="og:title" content="Simon &amp; Garfunkel &#39;66">"""
+        assertEquals("Simon & Garfunkel '66", resolver.parseOg(entities)?.title)
+
+        val singleQuoted = """<meta property='og:title' content='Song'>"""
+        assertEquals("Song", resolver.parseOg(singleQuoted)?.title)
+
+        val spaced = """<meta property = "og:title" content = "Spaced">"""
+        assertEquals("Spaced", resolver.parseOg(spaced)?.title)
+    }
+
+    @Test
+    fun `the bullet artist convention applies only to yandex`() {
+        val html = """
+            <meta property="og:title" content="T"/>
+            <meta property="og:description" content="Artist • Трек • 2026"/>
+        """.trimIndent()
+        assertEquals("Artist", resolver.parseOg(html, bulletArtist = true)?.artist)
+        // Other hosts do not use that format, so guessing an artist from it would be wrong.
+        assertEquals("", resolver.parseOg(html, bulletArtist = false)?.artist)
+    }
+
+    @Test
+    fun `id extraction requires proper boundaries`() {
+        assertNull(resolver.appleTrackId("https://music.apple.com/x?i=123junk"))
+        assertEquals("123", resolver.appleTrackId("https://music.apple.com/x?i=123"))
+        assertEquals("123", resolver.appleTrackId("https://music.apple.com/x?i=123&uo=4"))
+        assertNull(resolver.spotifyTrackId("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqTEXTRA"))
+    }
+
+    @Test
+    fun `host matching requires a label boundary`() {
+        assertTrue(resolver.hostMatches("music.apple.com", "apple.com"))
+        assertTrue(resolver.hostMatches("apple.com", "apple.com"))
+        assertFalse(resolver.hostMatches("notapple.com", "apple.com"))
+    }
+
+    @Test
+    fun `a spotify source without credentials still resolves via oembed`() = runTest {
+        val source = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
+        coEvery { web.get(match { it.startsWith("https://open.spotify.com/oembed") }, any()) } returns
+            """{"title":"Never Gonna Give You Up"}"""
+        coEvery { web.get(match { it.startsWith("https://itunes.apple.com/search") }, any()) } returns itunesJson
+        coEvery { web.get(match { it.startsWith("https://music.yandex.ru/search") }, any()) } returns yandexHtml
+
+        val r = MusicResolver(web, ytSearch = { "https://youtu.be/x" }, spotify = null).resolve(source)!!
+        assertEquals("Never Gonna Give You Up", r.identity.title)
+        // The posted Spotify link is still surfaced even though we could not query Spotify.
+        assertEquals(source, r.links["Spotify"])
+    }
+
+    @Test
+    fun `one failing lookup does not cancel the others`() = runTest {
+        val source = "https://music.yandex.ru/album/1/track/2"
+        coEvery { web.get(source, any()) } returns yandexHtml
+        coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any()) } throws RuntimeException("apple down")
+        coEvery { web.get(match { it.startsWith("https://music.yandex.ru/search") }, any()) } returns yandexHtml
+
+        val r = MusicResolver(web, ytSearch = { "https://youtu.be/x" }).resolve(source)!!
+        assertEquals("https://youtu.be/x", r.youtubeUrl)
+        assertTrue(!r.links.containsKey("Apple Music"))
     }
 
     @Test

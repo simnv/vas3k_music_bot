@@ -355,7 +355,9 @@ class Bot(
         // Odesli is off (no API key) or matched nothing: resolve the music hosts ourselves.
         var resolverYoutubeUrl: String? = null
         val resolved = if (links.isEmpty()) {
-            urlEntities.filter { linkBuilder.isKnownOdesliMusicUrl(it.text) }
+            // Only hosts we cannot download directly. A downloadable one (music.youtube.com) already
+            // has its own path below, which reuses the posted URL and its yt-dlp metadata.
+            urlEntities.filter { linkBuilder.isKnownOdesliMusicUrl(it.text) && !urlValidator.isValidDownloadUrl(it.text) }
                 .firstNotNullOfOrNull { entity -> musicResolver.resolve(entity.text) }
                 ?.also { resolverYoutubeUrl = it.youtubeUrl }
         } else null

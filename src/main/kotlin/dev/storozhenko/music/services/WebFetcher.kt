@@ -23,8 +23,8 @@ class WebFetcher(
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build()
 
-    /** Response body, or null on any non-200 / failure. Never throws. */
-    open suspend fun get(url: String, headers: Map<String, String> = emptyMap()): String? =
+    /** Response body, or null on any non-200 / failure. Never throws, except to honour cancellation. */
+    suspend fun get(url: String, headers: Map<String, String> = emptyMap()): String? =
         runInterruptible(virtualDispatcher) {
             runCatching {
                 val builder = HttpRequest.newBuilder().uri(URI.create(url)).timeout(timeout)
@@ -39,6 +39,9 @@ class WebFetcher(
                     response.body()
                 }
             }.getOrElse {
+                // Cancellation must propagate: the user's cancel button relies on it, and
+                // swallowing it here would leave the job running after the message is deleted.
+                if (it is InterruptedException) throw it
                 logger.info("GET $url failed: ${it.message}")
                 null
             }

@@ -2,8 +2,10 @@ package dev.storozhenko.music.services
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.storozhenko.music.getLogger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import org.jsoup.Jsoup
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -28,7 +30,7 @@ data class ResolvedTrack(
  * Odesli API whose free tier now returns 401 PUBLIC_API_ACCESS_DEPRECATED.
  *
  * Two stages: identify (artist, title) from the posted link, then look the track up elsewhere.
- * Lookups run concurrently — they are independent, and doing them in series would add their
+ * Lookups run concurrently — they are independent, and running them in series would add their
  * latencies together inside the admission slot.
  */
 class MusicResolver(
@@ -44,14 +46,17 @@ class MusicResolver(
         val query = identity.query
         if (query.isBlank()) return null
 
-        val (apple, yandex, spotifyUrl, youtube) = coroutineScope {
+        val results = coroutineScope {
             // Seed each platform with the posted URL rather than searching for what we were given.
-            val appleJob = async { sourceIfHost(sourceUrl, "apple.com") ?: searchApple(query) }
-            val yandexJob = async { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandex(query) }
-            val spotifyJob = async { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchTrackUrl(query) }
-            val youtubeJob = async { runCatching { ytSearch(query) }.getOrNull() }
-            Quad(appleJob.await(), yandexJob.await(), spotifyJob.await(), youtubeJob.await())
+            val apple = async { safe { sourceIfHost(sourceUrl, "apple.com") ?: searchApple(query) } }
+            val yandex = async { safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandex(query) } }
+            val spot = async { safe { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchTrackUrl(query) } }
+            val youtube = async {
+                safe { sourceIfHost(sourceUrl, "youtube.com", "youtu.be") ?: ytSearch(query) }
+            }
+            listOf(apple.await(), yandex.await(), spot.await(), youtube.await())
         }
+        val (apple, yandex, spotifyUrl, youtube) = results
 
         val links = linkedMapOf<String, String>()
         yandex?.let { links["Yandex.Music"] = it }
@@ -62,34 +67,64 @@ class MusicResolver(
         return ResolvedTrack(identity, links, youtube)
     }
 
-    private data class Quad(val a: String?, val b: String?, val c: String?, val d: String?)
+    /**
+     * One failing lookup must not cancel its siblings — `coroutineScope` would otherwise propagate
+     * the failure and lose the platforms that did resolve. Cancellation itself must still escape.
+     */
+    private suspend fun <T> safe(block: suspend () -> T?): T? = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        logger.info("Lookup failed: ${e.message}")
+        null
+    }
+
+    internal fun hostMatches(host: String, suffix: String): Boolean =
+        host == suffix || host.endsWith(".$suffix")
 
     private fun sourceIfHost(url: String, vararg suffixes: String): String? = runCatching {
         val host = URI(url).host.lowercase()
-        url.takeIf { suffixes.any { s -> host == s || host.endsWith(".$s") } }
+        url.takeIf { suffixes.any { s -> hostMatches(host, s) } }
     }.getOrNull()
 
     // ---- stage 1: identify -------------------------------------------------
 
     suspend fun identify(url: String): TrackIdentity? {
-        val host = runCatching { URI(url).host.lowercase() }.getOrNull() ?: return null
+        val host = runCatching { URI(url).host?.lowercase() }.getOrNull() ?: return null
         return when {
-            host.endsWith("apple.com") -> appleLookup(url)
-            host.endsWith("yandex.ru") || host.endsWith("yandex.com") -> ogIdentity(url)
-            host.endsWith("spotify.com") -> spotify?.trackIdentity(spotifyTrackId(url) ?: return null)
-            else -> ogIdentity(url)
+            hostMatches(host, "apple.com") -> appleLookup(url)
+            hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> ogIdentity(url, bulletArtist = true)
+            hostMatches(host, "spotify.com") -> spotifyIdentity(url)
+            else -> ogIdentity(url, bulletArtist = false)
         }
     }
 
     /** Apple/iTunes links carry the track id in `?i=`; the keyless lookup API gives exact metadata. */
     internal fun appleTrackId(url: String): String? =
-        Regex("[?&]i=(\\d+)").find(url)?.groupValues?.get(1)
+        Regex("[?&]i=(\\d+)(?:&|$)").find(url)?.groupValues?.get(1)
 
     private suspend fun appleLookup(url: String): TrackIdentity? {
-        val id = appleTrackId(url) ?: return ogIdentity(url)
+        val id = appleTrackId(url) ?: return ogIdentity(url, bulletArtist = false)
         val body = web.get("https://itunes.apple.com/lookup?id=$id") ?: return null
         return parseItunes(body)
     }
+
+    /**
+     * Spotify pages are JS-rendered with no og: tags. With credentials the Web API gives artist and
+     * title; without them oEmbed still yields the title, which is a weaker but usable query.
+     */
+    private suspend fun spotifyIdentity(url: String): TrackIdentity? {
+        val id = spotifyTrackId(url) ?: return null
+        spotify?.trackIdentity(id)?.let { return it }
+        val body = web.get("https://open.spotify.com/oembed?url=$url") ?: return null
+        return parseOembedTitle(body)
+    }
+
+    internal fun parseOembedTitle(body: String): TrackIdentity? = runCatching {
+        mapper.readTree(body).path("title").asText("").takeIf { it.isNotBlank() }
+            ?.let { TrackIdentity("", it) }
+    }.getOrNull()
 
     internal fun parseItunes(body: String): TrackIdentity? = runCatching {
         val first = mapper.readTree(body).path("results").firstOrNull() ?: return null
@@ -103,33 +138,34 @@ class MusicResolver(
             ?.path("trackViewUrl")?.asText("")?.takeIf { it.isNotBlank() }
     }.getOrNull()
 
-    private suspend fun ogIdentity(url: String): TrackIdentity? =
-        web.get(url)?.let { parseOg(it) }
+    private suspend fun ogIdentity(url: String, bulletArtist: Boolean): TrackIdentity? =
+        web.get(url)?.let { parseOg(it, bulletArtist) }
 
     /**
-     * Yandex renders `og:title` as the track name and `og:description` as "Artist • Трек • Year",
-     * so the artist is the first bullet-separated field.
+     * Parsed with Jsoup rather than a regex: og content is HTML, so it carries entities
+     * (`&amp;`, `&#39;`) that must be decoded, and a hand-rolled attribute pattern truncates a
+     * double-quoted value at the first apostrophe — "Don't Stop" would become "Don".
+     *
+     * @param bulletArtist Yandex renders og:description as "Artist • Трек • Year". That convention
+     *   is Yandex's own, so it is not applied to other hosts.
      */
-    internal fun parseOg(html: String): TrackIdentity? {
-        val title = metaContent(html, "og:title") ?: return null
-        val description = metaContent(html, "og:description").orEmpty()
-        val artist = description.split("•").firstOrNull()?.trim().orEmpty()
+    internal fun parseOg(html: String, bulletArtist: Boolean = true): TrackIdentity? {
+        val doc = Jsoup.parse(html)
+        val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
+            ?: doc.selectFirst("meta[name=og:title]")?.attr("content")
+            ?: return null
         if (title.isBlank()) return null
+        val artist = if (bulletArtist) {
+            val description = doc.selectFirst("meta[property=og:description]")?.attr("content").orEmpty()
+            description.substringBefore("•").trim()
+        } else {
+            ""
+        }
         return TrackIdentity(artist, title)
     }
 
-    private fun metaContent(html: String, property: String): String? =
-        Regex(
-            "<meta[^>]+(?:property|name)=[\"']$property[\"'][^>]*content=[\"']([^\"']*)[\"']",
-            RegexOption.IGNORE_CASE,
-        ).find(html)?.groupValues?.get(1)
-            ?: Regex(
-                "<meta[^>]+content=[\"']([^\"']*)[\"'][^>]*(?:property|name)=[\"']$property[\"']",
-                RegexOption.IGNORE_CASE,
-            ).find(html)?.groupValues?.get(1)
-
     internal fun spotifyTrackId(url: String): String? =
-        Regex("/track/([A-Za-z0-9]{22})").find(url)?.groupValues?.get(1)
+        Regex("/track/([A-Za-z0-9]{22})(?:[/?#]|$)").find(url)?.groupValues?.get(1)
 
     // ---- stage 2: search ---------------------------------------------------
 
