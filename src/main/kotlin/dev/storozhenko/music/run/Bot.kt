@@ -106,7 +106,9 @@ class Bot(
             null
         }
         musicResolver = MusicResolver(
-            web = WebFetcher(virtualDispatcher),
+            // Yandex answers this host with 451 unless the request exits via the same SOCKS proxy
+            // already used for VK and RuTube.
+            web = WebFetcher(virtualDispatcher, socksProxy = ytdlProxy),
             ytSearch = { query -> downloader.ytSearchFirst(query) },
             spotify = spotify,
         )

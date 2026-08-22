@@ -24,11 +24,14 @@ class MusicResolverTest {
         "trackViewUrl":"https://music.apple.com/us/album/x/6793443883?i=6793443884&uo=4"}]}
     """.trimIndent()
 
-    private val yandexHtml = """
-        <html><head>
-        <meta property="og:title" content="Владивосток"/>
-        <meta property="og:description" content="BEARWOLF • Трек • 2026"/>
-        </head><body><a href="/album/43183857/track/153933899">x</a></body></html>
+    private val yandexTrackJson = """
+        {"result":{"id":"153933899","title":"Владивосток",
+        "artists":[{"name":"BEARWOLF"}],"albums":[{"id":43183857}]}}
+    """.trimIndent()
+
+    private val yandexSearchJson = """
+        {"result":{"tracks":{"results":[
+        {"id":153933899,"title":"Владивосток","albums":[{"id":43183857}]}]}}}
     """.trimIndent()
 
     @Test
@@ -48,9 +51,16 @@ class MusicResolverTest {
     }
 
     @Test
-    fun `parses artist from the yandex og description`() {
-        // og:description is "Artist • Трек • Year"; the artist is the first bullet field.
-        assertEquals(TrackIdentity("BEARWOLF", "Владивосток"), resolver.parseOg(yandexHtml))
+    fun `parses identity from the yandex track api`() {
+        assertEquals(TrackIdentity("BEARWOLF", "Владивосток"), resolver.parseYandexTrack(yandexTrackJson))
+        assertNull(resolver.parseYandexTrack("""{"result":{}}"""))
+        assertNull(resolver.parseYandexTrack("nonsense"))
+    }
+
+    @Test
+    fun `extracts the yandex track id`() {
+        assertEquals("153933899", resolver.yandexTrackId("https://music.yandex.ru/album/43183857/track/153933899"))
+        assertNull(resolver.yandexTrackId("https://music.yandex.ru/album/43183857"))
     }
 
     @Test
@@ -61,9 +71,9 @@ class MusicResolverTest {
     }
 
     @Test
-    fun `finds the first yandex track path`() {
-        assertEquals("https://music.yandex.ru/album/43183857/track/153933899", resolver.firstYandexTrack(yandexHtml))
-        assertNull(resolver.firstYandexTrack("<html>nothing</html>"))
+    fun `builds the yandex web url from the search api`() {
+        assertEquals("https://music.yandex.ru/album/43183857/track/153933899", resolver.parseYandexSearch(yandexSearchJson))
+        assertNull(resolver.parseYandexSearch("""{"result":{"tracks":{"results":[]}}}"""))
     }
 
     @Test
@@ -86,8 +96,8 @@ class MusicResolverTest {
     @Test
     fun `resolves a yandex link and echoes the source instead of re-searching it`() = runTest {
         val source = "https://music.yandex.ru/album/43183857/track/153933899"
-        coEvery { web.get(source, any()) } returns yandexHtml
-        coEvery { web.get(match { it.startsWith("https://itunes.apple.com/search") }, any()) } returns itunesJson
+        coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
+        coEvery { web.get(match { it.startsWith("https://itunes.apple.com/search") }, any(), any()) } returns itunesJson
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/abc" }).resolve(source)!!
 
         assertEquals(TrackIdentity("BEARWOLF", "Владивосток"), r.identity)
@@ -100,15 +110,15 @@ class MusicResolverTest {
 
     @Test
     fun `returns null when the track cannot be identified`() = runTest {
-        coEvery { web.get(any(), any()) } returns null
+        coEvery { web.get(any(), any(), any()) } returns null
         assertNull(resolver.resolve("https://music.yandex.ru/album/1/track/2"))
     }
 
     @Test
     fun `spotify is omitted when no client is configured`() = runTest {
         val source = "https://music.yandex.ru/album/1/track/2"
-        coEvery { web.get(source, any()) } returns yandexHtml
-        coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any()) } returns null
+        coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
+        coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any(), any()) } returns null
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/abc" }, spotify = null).resolve(source)!!
         assertTrue(!r.links.containsKey("Spotify"))
     }
@@ -158,10 +168,10 @@ class MusicResolverTest {
     @Test
     fun `a spotify source without credentials still resolves via oembed`() = runTest {
         val source = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
-        coEvery { web.get(match { it.startsWith("https://open.spotify.com/oembed") }, any()) } returns
+        coEvery { web.get(match { it.startsWith("https://open.spotify.com/oembed") }, any(), any()) } returns
             """{"title":"Never Gonna Give You Up"}"""
-        coEvery { web.get(match { it.startsWith("https://itunes.apple.com/search") }, any()) } returns itunesJson
-        coEvery { web.get(match { it.startsWith("https://music.yandex.ru/search") }, any()) } returns yandexHtml
+        coEvery { web.get(match { it.startsWith("https://itunes.apple.com/search") }, any(), any()) } returns itunesJson
+        coEvery { web.get(match { it.contains("api.music.yandex.net/search") }, any(), any()) } returns yandexSearchJson
 
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/x" }, spotify = null).resolve(source)!!
         assertEquals("Never Gonna Give You Up", r.identity.title)
@@ -172,9 +182,9 @@ class MusicResolverTest {
     @Test
     fun `one failing lookup does not cancel the others`() = runTest {
         val source = "https://music.yandex.ru/album/1/track/2"
-        coEvery { web.get(source, any()) } returns yandexHtml
-        coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any()) } throws RuntimeException("apple down")
-        coEvery { web.get(match { it.startsWith("https://music.yandex.ru/search") }, any()) } returns yandexHtml
+        coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
+        coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any(), any()) } throws RuntimeException("apple down")
+        coEvery { web.get(match { it.contains("api.music.yandex.net/search") }, any(), any()) } returns yandexSearchJson
 
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/x" }).resolve(source)!!
         assertEquals("https://youtu.be/x", r.youtubeUrl)
@@ -184,8 +194,8 @@ class MusicResolverTest {
     @Test
     fun `a failing youtube search does not sink the whole resolution`() = runTest {
         val source = "https://music.yandex.ru/album/1/track/2"
-        coEvery { web.get(source, any()) } returns yandexHtml
-        coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any()) } returns itunesJson
+        coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
+        coEvery { web.get(match { it.startsWith("https://itunes.apple.com") }, any(), any()) } returns itunesJson
         val r = MusicResolver(web, ytSearch = { throw RuntimeException("yt-dlp exploded") }).resolve(source)!!
         assertNull(r.youtubeUrl)
         assertTrue(r.links.containsKey("Apple Music"))

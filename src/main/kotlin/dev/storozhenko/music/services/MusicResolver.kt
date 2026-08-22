@@ -94,7 +94,7 @@ class MusicResolver(
         val host = runCatching { URI(url).host?.lowercase() }.getOrNull() ?: return null
         return when {
             hostMatches(host, "apple.com") -> appleLookup(url)
-            hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> ogIdentity(url, bulletArtist = true)
+            hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> yandexLookup(url)
             hostMatches(host, "spotify.com") -> spotifyIdentity(url)
             else -> ogIdentity(url, bulletArtist = false)
         }
@@ -176,17 +176,45 @@ class MusicResolver(
     }
 
     /**
-     * The public search page. The internal `handlers/music-search.jsx` endpoint the old
-     * MusicSearchService used now returns 404, and Yandex publishes no other API.
+     * Yandex's app-facing API, proxied. The web front end is unusable from a datacenter address —
+     * the search page answers with a captcha and track pages with a metadata-free JS shell — and
+     * `api.music.yandex.net` returns HTTP 451 unless the request exits through the SOCKS proxy that
+     * already carries VK and RuTube traffic. The old `handlers/music-search.jsx` endpoint is 404.
      */
     private suspend fun searchYandex(query: String): String? {
-        val html = web.get("https://music.yandex.ru/search?text=${encode(query)}&type=tracks") ?: return null
-        return firstYandexTrack(html)
+        val body = web.get(
+            "https://api.music.yandex.net/search?text=${encode(query)}&type=track&page=0",
+            useProxy = true,
+        ) ?: return null
+        return parseYandexSearch(body)
     }
 
-    /** First `/album/N/track/M` in the markup is the top search hit (verified against known tracks). */
-    internal fun firstYandexTrack(html: String): String? =
-        Regex("/album/\\d+/track/\\d+").find(html)?.value?.let { "https://music.yandex.ru$it" }
+    private suspend fun yandexLookup(url: String): TrackIdentity? {
+        val id = yandexTrackId(url) ?: return null
+        val body = web.get("https://api.music.yandex.net/tracks/$id", useProxy = true) ?: return null
+        return parseYandexTrack(body)
+    }
+
+    internal fun yandexTrackId(url: String): String? =
+        Regex("/track/(\\d+)(?:[/?#]|$)").find(url)?.groupValues?.get(1)
+
+    internal fun parseYandexTrack(body: String): TrackIdentity? = runCatching {
+        val track = mapper.readTree(body).path("result").let { if (it.isArray) it.firstOrNull() else it }
+            ?: return null
+        val title = track.path("title").asText("")
+        val artist = track.path("artists").firstOrNull()?.path("name")?.asText("").orEmpty()
+        if (title.isBlank()) null else TrackIdentity(artist, title)
+    }.getOrNull()
+
+    /** Top search hit, rendered as the canonical `/album/{albumId}/track/{trackId}` web URL. */
+    internal fun parseYandexSearch(body: String): String? = runCatching {
+        val hit = mapper.readTree(body).path("result").path("tracks").path("results").firstOrNull()
+            ?: return null
+        val trackId = hit.path("id").asText("").takeIf { it.isNotBlank() } ?: return null
+        val albumId = hit.path("albums").firstOrNull()?.path("id")?.asText("")?.takeIf { it.isNotBlank() }
+            ?: return null
+        "https://music.yandex.ru/album/$albumId/track/$trackId"
+    }.getOrNull()
 
     private fun encode(s: String): String = URLEncoder.encode(s, StandardCharsets.UTF_8)
 }
