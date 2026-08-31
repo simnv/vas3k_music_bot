@@ -54,8 +54,13 @@ class LinkMessageBuilder {
         return element?.attr("href")
     }
 
+    /**
+     * The title must stay out of the format string. Interpolating it first meant a title ending in
+     * "18%" produced "…18% [%02d:%02d]", where Formatter read "% " as a conversion and threw
+     * UnknownFormatConversionException, killing the whole update.
+     */
     fun formatTitleWithDuration(meta: VideoMeta): String =
-        meta.durationSec?.let { "${meta.title} [%02d:%02d]".format(it / 60, it % 60) } ?: meta.title
+        meta.durationSec?.let { "${meta.title} [${"%02d:%02d".format(it / 60, it % 60)}]" } ?: meta.title
 
     fun stripAnnotations(s: String): String =
         s.replace(Regex("\\s*\\[[^\\]]*\\]"), "")

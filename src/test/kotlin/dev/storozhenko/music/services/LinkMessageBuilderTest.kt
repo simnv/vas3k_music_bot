@@ -121,6 +121,29 @@ class LinkMessageBuilderTest {
     }
 
     @Test
+    fun `formats a title containing a percent sign`() {
+        // Real crash: "Particle & Catching Cairo - 18%" was interpolated into the format string, so
+        // Formatter read "% " as a conversion and threw UnknownFormatConversionException.
+        assertEquals(
+            "Particle & Catching Cairo - 18% [03:34]",
+            builder.formatTitleWithDuration(VideoMeta("Particle & Catching Cairo - 18%", 214)),
+        )
+    }
+
+    @Test
+    fun `formats titles containing format specifiers literally`() {
+        assertEquals("100%d of it [00:05]", builder.formatTitleWithDuration(VideoMeta("100%d of it", 5)))
+        assertEquals("%s%n%% [01:00]", builder.formatTitleWithDuration(VideoMeta("%s%n%%", 60)))
+    }
+
+    @Test
+    fun `pads minutes and seconds, and passes the title through without a duration`() {
+        assertEquals("Song [00:07]", builder.formatTitleWithDuration(VideoMeta("Song", 7)))
+        assertEquals("Song [100:00]", builder.formatTitleWithDuration(VideoMeta("Song", 6000)))
+        assertEquals("Song", builder.formatTitleWithDuration(VideoMeta("Song", null)))
+    }
+
+    @Test
     fun `formats a resolved track with escaped metadata`() {
         val track = ResolvedTrack(
             identity = TrackIdentity("AC/DC & Co", "Rock <n> Roll"),
