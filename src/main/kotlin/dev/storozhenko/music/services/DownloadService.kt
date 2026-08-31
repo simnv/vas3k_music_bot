@@ -225,12 +225,33 @@ class DownloadService(
         }
         logger.info(command.shellJoin())
         val process = ProcessBuilder(command).redirectErrorStream(true).start()
-        val output = BufferedReader(InputStreamReader(process.inputStream)).readLine() ?: ""
-        logger.info("Got $output from yt-dlp")
+        val lines = BufferedReader(InputStreamReader(process.inputStream)).use { it.readLines() }
+        logger.info("Got ${lines.joinToString(" | ")} from yt-dlp")
         process.waitFor()
-        if (output.contains(": No video formats found!")) return@runInterruptible VideoMeta("", null)
-        val parts = output.split("\t", limit = 2)
-        VideoMeta(parts.getOrNull(0).orEmpty(), parts.getOrNull(1)?.toIntOrNull())
+        parseVideoMeta(lines)
+    }
+
+    /**
+     * Picks the `--print` line out of yt-dlp's output.
+     *
+     * stderr is merged into stdout, so diagnostics can precede the value. Taking the first line
+     * blindly meant a leading "WARNING: [youtube] ...: Some web client..." became the video title,
+     * which then reached the caption and the music-search query.
+     *
+     * The printed line is `title<TAB>duration`, so the tab identifies it. Diagnostics have no tab.
+     */
+    internal fun parseVideoMeta(lines: List<String>): VideoMeta {
+        if (lines.any { it.contains(": No video formats found!") }) return VideoMeta("", null)
+        val printed = lines.firstOrNull { it.contains('\t') && !it.isDiagnostic() }
+            ?: lines.firstOrNull { !it.isDiagnostic() && it.isNotBlank() }
+            ?: return VideoMeta("", null)
+        val parts = printed.split("\t", limit = 2)
+        return VideoMeta(parts.getOrNull(0).orEmpty(), parts.getOrNull(1)?.toIntOrNull())
+    }
+
+    private fun String.isDiagnostic(): Boolean {
+        val s = trimStart()
+        return s.startsWith("WARNING:") || s.startsWith("ERROR:") || s.startsWith("[")
     }
 
     private fun scheduleDelete(file: File) {
