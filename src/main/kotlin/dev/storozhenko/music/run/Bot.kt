@@ -4,6 +4,7 @@ import dev.storozhenko.music.RequestOptions
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.parseRequestOptions
 import dev.storozhenko.music.shouldForceAudio
+import dev.storozhenko.music.split2ByDash
 import dev.storozhenko.music.services.DownloadService
 import dev.storozhenko.music.services.ErrorNotificationService
 import dev.storozhenko.music.services.MediaProbeService
@@ -15,6 +16,7 @@ import dev.storozhenko.music.services.WebFetcher
 import dev.storozhenko.music.services.LinkMessageBuilder
 import dev.storozhenko.music.services.OdesilService
 import dev.storozhenko.music.services.TelegramSender
+import dev.storozhenko.music.services.TrackIdentity
 import dev.storozhenko.music.services.UrlValidator
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -401,10 +403,22 @@ class Bot(
                     odesilService.detect(ytUrl)
                 }
             } else null
-            linksMessage = if (odesilFromTitle != null) {
-                linkBuilder.mapOdesilResponse(odesilFromTitle) + "\n<a href=\"${validLink.text}\">${validLink.text}</a>"
-            } else {
-                partial
+
+            // Any downloadable source in a music chat gets a cross-platform lookup, keyed off the
+            // yt-dlp title. Previously only VK/RuTube did, and only via Odesli, so a YouTube link
+            // in a music chat showed just its own URL.
+            val resolvedFromTitle = if (odesilFromTitle == null && isMusicChat && meta.title.isNotBlank()) {
+                val (artist, title) = linkBuilder.stripAnnotations(meta.title).split2ByDash(reverseIfSingle = true)
+                musicResolver.resolveFor(TrackIdentity(artist, title), validLink.text)
+            } else null
+
+            linksMessage = when {
+                odesilFromTitle != null ->
+                    linkBuilder.mapOdesilResponse(odesilFromTitle) + "\n<a href=\"${validLink.text}\">${validLink.text}</a>"
+                // Only worth replacing the plain title+link if we actually found another service.
+                resolvedFromTitle != null && resolvedFromTitle.links.size > 1 ->
+                    linkBuilder.formatResolved(resolvedFromTitle)
+                else -> partial
             }
         }
 

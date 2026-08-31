@@ -42,8 +42,14 @@ class MusicResolver(
     private val logger = getLogger()
     private val mapper = ObjectMapper()
 
-    suspend fun resolve(sourceUrl: String): ResolvedTrack? {
-        val identity = identify(sourceUrl) ?: return null
+    suspend fun resolve(sourceUrl: String): ResolvedTrack? =
+        identify(sourceUrl)?.let { resolveFor(it, sourceUrl) }
+
+    /**
+     * Stage two on its own, for sources we can already name without inspecting their page — a
+     * YouTube link in a music chat, where yt-dlp has given us the title.
+     */
+    suspend fun resolveFor(identity: TrackIdentity, sourceUrl: String): ResolvedTrack? {
         val query = identity.query
         if (query.isBlank()) return null
 

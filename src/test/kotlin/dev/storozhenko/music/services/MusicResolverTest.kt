@@ -94,6 +94,27 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `resolveFor looks up a source we can already name`() = runTest {
+        // A YouTube link in a music chat: yt-dlp gave us the title, so there is nothing to identify.
+        val source = "https://youtu.be/G0qpZMFNthk"
+        coEvery { web.get(match { it.contains("country=ru") }, any(), any()) } returns itunesJson
+        coEvery { web.get(match { it.contains("api.music.yandex.net/search") }, any(), any()) } returns yandexSearchJson
+
+        val r = MusicResolver(web, ytSearch = { "https://youtu.be/other" })
+            .resolveFor(TrackIdentity("BEARWOLF", "Владивосток"), source)!!
+
+        // The posted YouTube URL wins over the search hit for its own platform.
+        assertEquals(source, r.links["YouTube"])
+        assertEquals("https://music.yandex.ru/album/43183857/track/153933899", r.links["Yandex.Music"])
+        assertTrue(r.links.containsKey("Apple Music"))
+    }
+
+    @Test
+    fun `resolveFor gives up on a blank identity`() = runTest {
+        assertNull(resolver.resolveFor(TrackIdentity("", ""), "https://youtu.be/x"))
+    }
+
+    @Test
     fun `extracts the yandex track id`() {
         assertEquals("153933899", resolver.yandexTrackId("https://music.yandex.ru/album/43183857/track/153933899"))
         assertNull(resolver.yandexTrackId("https://music.yandex.ru/album/43183857"))
