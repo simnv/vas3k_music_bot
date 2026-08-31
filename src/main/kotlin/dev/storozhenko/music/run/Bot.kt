@@ -212,7 +212,17 @@ class Bot(
         handleUrlMessage(update, urlEntities)
     }
 
-    private data class LinkResolution(val message: String, val downloadUrl: String?)
+    private companion object {
+        const val ALBUM_NOTE = "Это альбом — скачиваю только отдельные треки."
+        const val PLAYLIST_NOTE = "Плейлисты не поддерживаются — пришлите ссылку на трек или альбом."
+    }
+
+    /** [infoOnly] means reply with the message and download nothing — an album, not a track. */
+    private data class LinkResolution(
+        val message: String,
+        val downloadUrl: String?,
+        val infoOnly: Boolean = false,
+    )
 
     private suspend fun handleUrlMessage(update: Update, urlEntities: List<MessageEntity>) {
         val chatId = update.message.chatId
@@ -304,6 +314,13 @@ class Bot(
                 val authorName = update.message.from?.let { listOfNotNull(it.firstName, it.lastName).joinToString(" ").ifBlank { null } }
                 errorNotificationService?.sendMessageWithSourceInfo(message, authorName, authorUsername, chatId, update.message.messageId, chatTitle, requestMode)
 
+                if (resolution.infoOnly) {
+                    // Nothing to fetch, so no "Downloading..." and no cancel button.
+                    tmId?.let { sender.editMessageText(chatId, it, message, null) }
+                        ?: sendPlainMessage(chatId, message, replyToMessageId)
+                    return@withSlot
+                }
+
                 val mid: Int = tmId?.also {
                     sender.editMessageText(chatId, it, "$message\nDownloading...", cancelKb)
                 } ?: sendStatusMessage(chatId, message, replyToMessageId, cancelKb, cancelToken, originalUrl).also { tmId = it }
@@ -355,6 +372,25 @@ class Bot(
     ): LinkResolution? {
         val odesilDetections = urlEntities.mapNotNull { odesilService.detect(it) }
         val links = odesilDetections.map { linkBuilder.mapOdesilResponse(it.odesilResponse) }
+
+        val playlistUrl = urlEntities.map { it.text }.firstOrNull { musicResolver.isPlaylistUrl(it) }
+        if (playlistUrl != null) {
+            onDetected()
+            return LinkResolution(PLAYLIST_NOTE, null, infoOnly = true)
+        }
+
+        // Albums are answered with links only — see MusicResolver.resolveAlbum.
+        val albumUrl = urlEntities.map { it.text }
+            .firstOrNull { linkBuilder.isKnownOdesliMusicUrl(it) && musicResolver.isAlbumUrl(it) }
+        if (albumUrl != null) {
+            onDetected()
+            val album = musicResolver.resolveAlbum(albumUrl)
+            return if (album != null) {
+                LinkResolution(linkBuilder.formatResolved(album) + "\n\n$ALBUM_NOTE", null, infoOnly = true)
+            } else {
+                LinkResolution("❌ Не удалось найти этот альбом.", null, infoOnly = true)
+            }
+        }
 
         // Odesli is off (no API key) or matched nothing: resolve the music hosts ourselves.
         var resolverYoutubeUrl: String? = null
@@ -440,6 +476,19 @@ class Bot(
         // Prefer the resolver's structured URL: parsing it back out of the rendered HTML is what
         // the Odesli path did, and it couples the download target to message formatting.
         return LinkResolution("$linksMessage", resolverYoutubeUrl ?: youtubeFromMessage ?: ytSearchUrl)
+    }
+
+    /** Plain reply with no cancel button, for messages that start no job. */
+    private suspend fun sendPlainMessage(chatId: Long, text: String, replyToMessageId: Int): Int {
+        val sendMessage = SendMessage.builder()
+            .chatId(chatId.toString())
+            .text(text)
+            .parseMode("HTML")
+            .replyToMessageId(replyToMessageId)
+            .linkPreviewOptions(LinkPreviewOptions.builder().isDisabled(true).build())
+            .disableNotification(true)
+            .build()
+        return telegramClient.executeAsync(sendMessage).await().messageId
     }
 
     private suspend fun sendStatusMessage(

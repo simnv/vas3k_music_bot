@@ -95,6 +95,124 @@ class MusicResolver(
         url.takeIf { suffixes.any { s -> hostMatches(host, s) } }
     }.getOrNull()
 
+    // ---- albums ------------------------------------------------------------
+
+    /**
+     * Albums are linked, never downloaded: the user shared a record, not a file, and pulling every
+     * track would dump a dozen uploads into the chat.
+     *
+     * Returns null for anything that is not an album URL, so callers can fall through to the track
+     * path. [ResolvedTrack.youtubeUrl] is always null here, which is what stops the download.
+     */
+    suspend fun resolveAlbum(sourceUrl: String): ResolvedTrack? {
+        val identity = identifyAlbum(sourceUrl) ?: return null
+        if (identity.query.isBlank()) return null
+
+        val results = coroutineScope {
+            val apple = async { safe { sourceIfHost(sourceUrl, "apple.com") ?: searchAppleAlbum(identity.query) } }
+            val yandex = async {
+                safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandexAlbum(identity.query) }
+            }
+            val spot = async { safe { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchAlbumUrl(identity.query) } }
+            listOf(apple.await(), yandex.await(), spot.await())
+        }
+        val (apple, yandex, spotifyUrl) = results
+
+        val links = linkedMapOf<String, String>()
+        yandex?.let { links["Yandex.Music"] = it }
+        apple?.let { links["Apple Music"] = it }
+        spotifyUrl?.let { links["Spotify"] = it }
+        if (links.isEmpty()) return null
+        return ResolvedTrack(identity, links, youtubeUrl = null)
+    }
+
+    /** An album URL is one that names an album but no track within it. */
+    internal fun isAlbumUrl(url: String): Boolean = albumRef(url) != null
+
+    /**
+     * A playlist is somebody's arbitrary selection, not a release, so there is no equivalent to
+     * look up on the other services. Detected only to answer clearly instead of reporting that a
+     * track could not be found.
+     */
+    fun isPlaylistUrl(url: String): Boolean = runCatching {
+        val host = URI(url).host?.lowercase() ?: return false
+        when {
+            hostMatches(host, "spotify.com") -> url.contains("/playlist/")
+            hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> url.contains("/playlists/")
+            hostMatches(host, "apple.com") -> url.contains("/playlist/")
+            else -> false
+        }
+    }.getOrDefault(false)
+
+    private data class AlbumRef(val service: String, val id: String)
+
+    private fun albumRef(url: String): AlbumRef? {
+        val host = runCatching { URI(url).host?.lowercase() }.getOrNull() ?: return null
+        return when {
+            (hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com")) && yandexTrackId(url) == null ->
+                Regex("/album/(\\d+)").find(url)?.groupValues?.get(1)?.let { AlbumRef("yandex", it) }
+            hostMatches(host, "apple.com") && appleTrackId(url) == null ->
+                // .../album/<slug>/<collectionId>
+                Regex("/album/[^/]*/?(\\d+)").find(url)?.groupValues?.get(1)?.let { AlbumRef("apple", it) }
+            hostMatches(host, "spotify.com") ->
+                Regex("/album/([A-Za-z0-9]{22})(?:[/?#]|$)").find(url)?.groupValues?.get(1)
+                    ?.let { AlbumRef("spotify", it) }
+            else -> null
+        }
+    }
+
+    private suspend fun identifyAlbum(url: String): TrackIdentity? {
+        val ref = albumRef(url) ?: return null
+        return when (ref.service) {
+            "yandex" -> web.get("https://api.music.yandex.net/albums/${ref.id}", useProxy = true)
+                ?.let { parseYandexAlbum(it) }
+            "apple" -> web.get("https://itunes.apple.com/lookup?id=${ref.id}&entity=album")
+                ?.let { parseItunesAlbum(it) }
+            "spotify" -> spotify?.albumIdentity(ref.id)
+            else -> null
+        }
+    }
+
+    internal fun parseYandexAlbum(body: String): TrackIdentity? = runCatching {
+        val album = mapper.readTree(body).path("result").let { if (it.isArray) it.firstOrNull() else it }
+            ?: return null
+        val title = album.path("title").asText("")
+        val artist = album.path("artists").firstOrNull()?.path("name")?.asText("").orEmpty()
+        if (title.isBlank()) null else TrackIdentity(artist, title)
+    }.getOrNull()
+
+    internal fun parseItunesAlbum(body: String): TrackIdentity? = runCatching {
+        val first = mapper.readTree(body).path("results").firstOrNull() ?: return null
+        val title = first.path("collectionName").asText("")
+        val artist = first.path("artistName").asText("")
+        if (title.isBlank()) null else TrackIdentity(artist, title)
+    }.getOrNull()
+
+    internal fun parseYandexAlbumSearch(body: String): String? = runCatching {
+        val hit = mapper.readTree(body).path("result").path("albums").path("results").firstOrNull()
+            ?: return null
+        hit.path("id").asText("").takeIf { it.isNotBlank() }?.let { "https://music.yandex.ru/album/$it" }
+    }.getOrNull()
+
+    private suspend fun searchAppleAlbum(query: String): String? {
+        val term = encode(query)
+        val local = web.get(
+            "https://itunes.apple.com/search?term=$term&entity=album&limit=1&country=$appleStorefront"
+        )?.let { parseItunesAlbumUrl(it) }
+        if (local != null) return local
+        return web.get("https://itunes.apple.com/search?term=$term&entity=album&limit=1")
+            ?.let { parseItunesAlbumUrl(it) }
+    }
+
+    internal fun parseItunesAlbumUrl(body: String): String? = runCatching {
+        mapper.readTree(body).path("results").firstOrNull()
+            ?.path("collectionViewUrl")?.asText("")?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    private suspend fun searchYandexAlbum(query: String): String? =
+        web.get("https://api.music.yandex.net/search?text=${encode(query)}&type=album&page=0", useProxy = true)
+            ?.let { parseYandexAlbumSearch(it) }
+
     // ---- stage 1: identify -------------------------------------------------
 
     suspend fun identify(url: String): TrackIdentity? {

@@ -115,6 +115,78 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `distinguishes album urls from track urls`() {
+        assertTrue(resolver.isAlbumUrl("https://music.yandex.ru/album/43183857"))
+        assertFalse(resolver.isAlbumUrl("https://music.yandex.ru/album/43183857/track/153933899"))
+        assertTrue(resolver.isAlbumUrl("https://music.apple.com/ru/album/name/6793443883"))
+        assertFalse(resolver.isAlbumUrl("https://music.apple.com/ru/album/name/6793443883?i=6793443884"))
+        assertTrue(resolver.isAlbumUrl("https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"))
+        assertFalse(resolver.isAlbumUrl("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"))
+        // A playlist is not an album and must not be treated as one.
+        assertFalse(resolver.isAlbumUrl("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"))
+        assertFalse(resolver.isAlbumUrl("https://youtu.be/abc"))
+    }
+
+    @Test
+    fun `parses album identity from yandex and itunes`() {
+        assertEquals(
+            TrackIdentity("BEARWOLF", "Владивосток"),
+            resolver.parseYandexAlbum("""{"result":{"id":43183857,"title":"Владивосток","artists":[{"name":"BEARWOLF"}]}}"""),
+        )
+        assertEquals(
+            TrackIdentity("BEARWOLF", "Владивосток - Single"),
+            resolver.parseItunesAlbum("""{"results":[{"collectionName":"Владивосток - Single","artistName":"BEARWOLF"}]}"""),
+        )
+        assertNull(resolver.parseYandexAlbum("""{"result":{}}"""))
+    }
+
+    @Test
+    fun `builds album urls from search results`() {
+        assertEquals(
+            "https://music.yandex.ru/album/43183857",
+            resolver.parseYandexAlbumSearch("""{"result":{"albums":{"results":[{"id":43183857}]}}}"""),
+        )
+        assertNull(resolver.parseYandexAlbumSearch("""{"result":{"albums":{"results":[]}}}"""))
+        assertEquals(
+            "https://music.apple.com/ru/album/x/1",
+            resolver.parseItunesAlbumUrl("""{"results":[{"collectionViewUrl":"https://music.apple.com/ru/album/x/1"}]}"""),
+        )
+    }
+
+    @Test
+    fun `resolves an album to links and never to a download`() = runTest {
+        val source = "https://music.yandex.ru/album/43183857"
+        coEvery { web.get(match { it.contains("api.music.yandex.net/albums") }, any(), any()) } returns
+            """{"result":{"title":"Владивосток","artists":[{"name":"BEARWOLF"}]}}"""
+        coEvery { web.get(match { it.contains("entity=album") && it.contains("country=ru") }, any(), any()) } returns
+            """{"results":[{"collectionViewUrl":"https://music.apple.com/ru/album/x/1"}]}"""
+
+        val r = MusicResolver(web, ytSearch = { "https://youtu.be/should-not-be-used" }).resolveAlbum(source)!!
+
+        assertEquals(TrackIdentity("BEARWOLF", "Владивосток"), r.identity)
+        assertEquals(source, r.links["Yandex.Music"])
+        assertEquals("https://music.apple.com/ru/album/x/1", r.links["Apple Music"])
+        // youtubeUrl is what would trigger a download, and an album must never start one.
+        assertNull(r.youtubeUrl)
+        assertFalse(r.links.containsKey("YouTube"))
+    }
+
+    @Test
+    fun `resolveAlbum ignores track urls`() = runTest {
+        assertNull(resolver.resolveAlbum("https://music.yandex.ru/album/1/track/2"))
+    }
+
+    @Test
+    fun `recognises playlists, which are not albums`() {
+        assertTrue(resolver.isPlaylistUrl("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"))
+        assertTrue(resolver.isPlaylistUrl("https://music.yandex.ru/users/someone/playlists/1000"))
+        assertTrue(resolver.isPlaylistUrl("https://music.apple.com/ru/playlist/x/pl.123"))
+        assertFalse(resolver.isPlaylistUrl("https://music.yandex.ru/album/43183857"))
+        assertFalse(resolver.isPlaylistUrl("https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"))
+        assertFalse(resolver.isPlaylistUrl("https://youtu.be/abc"))
+    }
+
+    @Test
     fun `extracts the yandex track id`() {
         assertEquals("153933899", resolver.yandexTrackId("https://music.yandex.ru/album/43183857/track/153933899"))
         assertNull(resolver.yandexTrackId("https://music.yandex.ru/album/43183857"))

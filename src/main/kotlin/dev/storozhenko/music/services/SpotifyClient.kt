@@ -116,6 +116,22 @@ class SpotifyClient(
         return parseSearchUrl(body)
     }
 
+    suspend fun albumIdentity(albumId: String, now: Instant = Instant.now()): TrackIdentity? {
+        val body = apiGet("albums/$albumId", now) ?: return null
+        return parseTrack(body) // albums carry the same name/artists shape
+    }
+
+    suspend fun searchAlbumUrl(query: String, now: Instant = Instant.now()): String? {
+        val encoded = URLEncoder.encode(query, StandardCharsets.UTF_8)
+        val body = apiGet("search?q=$encoded&type=album&limit=1", now) ?: return null
+        return parseAlbumSearchUrl(body)
+    }
+
+    internal fun parseAlbumSearchUrl(body: String): String? = runCatching {
+        mapper.readTree(body).path("albums").path("items").firstOrNull()
+            ?.path("external_urls")?.path("spotify")?.asText("")?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
     internal fun parseTrack(body: String): TrackIdentity? = runCatching {
         val node = mapper.readTree(body)
         val title = node.path("name").asText("")
