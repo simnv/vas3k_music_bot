@@ -70,12 +70,12 @@ class MusicResolverTest {
     @Test
     fun `apple search prefers the configured storefront`() = runTest {
         val source = "https://music.yandex.ru/album/43183857/track/153933899"
-        val ruJson = itunesJson.replace("/us/", "/ru/")
+        val storefrontJson = itunesJson.replace("/us/", "/gb/")
         coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
-        coEvery { web.get(match { it.contains("country=ru") }, any(), any()) } returns ruJson
+        coEvery { web.get(match { it.contains("country=gb") }, any(), any()) } returns storefrontJson
 
         val r = MusicResolver(web, ytSearch = { null }).resolve(source)!!
-        assertTrue(r.links["Apple Music"]!!.contains("/ru/"), "expected a ru storefront link")
+        assertTrue(r.links["Apple Music"]!!.contains("/gb/"), "expected a gb storefront link")
     }
 
     @Test
@@ -83,7 +83,7 @@ class MusicResolverTest {
         val source = "https://music.yandex.ru/album/43183857/track/153933899"
         coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
         // Storefront miss, then the default catalogue answers.
-        coEvery { web.get(match { it.contains("country=ru") }, any(), any()) } returns
+        coEvery { web.get(match { it.contains("country=gb") }, any(), any()) } returns
             """{"resultCount":0,"results":[]}"""
         coEvery {
             web.get(match { it.startsWith("https://itunes.apple.com/search") && !it.contains("country=") }, any(), any())
@@ -97,7 +97,7 @@ class MusicResolverTest {
     fun `resolveFor looks up a source we can already name`() = runTest {
         // A YouTube link in a music chat: yt-dlp gave us the title, so there is nothing to identify.
         val source = "https://youtu.be/G0qpZMFNthk"
-        coEvery { web.get(match { it.contains("country=ru") }, any(), any()) } returns itunesJson
+        coEvery { web.get(match { it.contains("country=gb") }, any(), any()) } returns itunesJson
         coEvery { web.get(match { it.contains("api.music.yandex.net/search") }, any(), any()) } returns yandexSearchJson
 
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/other" })
@@ -158,7 +158,7 @@ class MusicResolverTest {
         val source = "https://music.yandex.ru/album/43183857"
         coEvery { web.get(match { it.contains("api.music.yandex.net/albums") }, any(), any()) } returns
             """{"result":{"title":"Владивосток","artists":[{"name":"BEARWOLF"}]}}"""
-        coEvery { web.get(match { it.contains("entity=album") && it.contains("country=ru") }, any(), any()) } returns
+        coEvery { web.get(match { it.contains("entity=album") && it.contains("country=gb") }, any(), any()) } returns
             """{"results":[{"collectionViewUrl":"https://music.apple.com/ru/album/x/1"}]}"""
 
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/should-not-be-used" }).resolveAlbum(source)!!

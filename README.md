@@ -353,7 +353,7 @@ artist and title from the posted link, then looks the track up on each service:
 | Service | How | Needs credentials |
 | --- | --- | --- |
 | Yandex Music | `music.yandex.ru/search` page, first track hit | no |
-| Apple Music / iTunes | `itunes.apple.com` search and lookup | no |
+| Apple Music / iTunes | `itunes.apple.com` search and lookup, `gb` storefront | no |
 | YouTube | `yt-dlp ytsearch` | no |
 | Spotify | Web API, client-credentials flow | **yes** |
 
