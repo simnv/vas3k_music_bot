@@ -66,6 +66,16 @@ class DownloadServiceMetaTest {
     }
 
     @Test
+    fun `a title that starts with a bracket is not mistaken for a diagnostic`() {
+        // "[Official Video] ..." and "[Full Album] ..." are ordinary YouTube titles.
+        val lines = listOf(
+            "WARNING: [youtube] x: skipped formats",
+            "[Full Album] Some Band - Record\t2400",
+        )
+        assertEquals(VideoMeta("[Full Album] Some Band - Record", 2400), service.parseVideoMeta(lines))
+    }
+
+    @Test
     fun `empty or diagnostic-only output degrades to blank`() {
         assertEquals(VideoMeta("", null), service.parseVideoMeta(emptyList()))
         assertEquals(VideoMeta("", null), service.parseVideoMeta(listOf("WARNING: only noise")))

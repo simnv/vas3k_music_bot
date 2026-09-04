@@ -242,17 +242,22 @@ class DownloadService(
      */
     internal fun parseVideoMeta(lines: List<String>): VideoMeta {
         if (lines.any { it.contains(": No video formats found!") }) return VideoMeta("", null)
-        val printed = lines.firstOrNull { it.contains('\t') && !it.isDiagnostic() }
-            ?: lines.firstOrNull { !it.isDiagnostic() && it.isNotBlank() }
+        // The tab is the discriminator, not the leading character: extractor chatter is bracketed
+        // but so are plenty of real titles ("[Full Album] ...", "[Official Video] ..."), and
+        // treating those as noise blanked the title just as surely as taking the warning did.
+        val printed = lines.firstOrNull { it.contains('\t') && !it.isSevereDiagnostic() }
+            ?: lines.firstOrNull { !it.isSevereDiagnostic() && !it.isExtractorChatter() && it.isNotBlank() }
             ?: return VideoMeta("", null)
         val parts = printed.split("\t", limit = 2)
         return VideoMeta(parts.getOrNull(0).orEmpty(), parts.getOrNull(1)?.toIntOrNull())
     }
 
-    private fun String.isDiagnostic(): Boolean {
+    private fun String.isSevereDiagnostic(): Boolean {
         val s = trimStart()
-        return s.startsWith("WARNING:") || s.startsWith("ERROR:") || s.startsWith("[")
+        return s.startsWith("WARNING:") || s.startsWith("ERROR:")
     }
+
+    private fun String.isExtractorChatter(): Boolean = trimStart().startsWith("[")
 
     private fun scheduleDelete(file: File) {
         fileDeleteScope.delayedDelete(file, logger) { e ->
