@@ -232,6 +232,17 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `album id must be a whole path segment`() {
+        assertEquals("6766853324", resolver.appleAlbumId("https://music.apple.com/dk/album/half-told-tales/6766853324"))
+        assertEquals("456", resolver.appleAlbumId("https://music.apple.com/gb/album/1999/456"))
+        assertEquals("123", resolver.appleAlbumId("https://music.apple.com/gb/album/name/123?l=en"))
+        assertEquals("99999", resolver.appleAlbumId("https://music.apple.com/gb/album/blink-182/99999?foo=1"))
+        // An unanchored pattern backtracked into the slug here and returned "9".
+        assertEquals("1999", resolver.appleAlbumId("https://music.apple.com/gb/album/1999"))
+        assertNull(resolver.appleAlbumId("https://music.apple.com/gb/album/abc"))
+    }
+
+    @Test
     fun `rewrites the storefront segment`() {
         assertEquals(
             "https://music.apple.com/gb/album/x/1",

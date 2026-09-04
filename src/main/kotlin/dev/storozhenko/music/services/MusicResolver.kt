@@ -175,8 +175,7 @@ class MusicResolver(
             (hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com")) && yandexTrackId(url) == null ->
                 Regex("/album/(\\d+)").find(url)?.groupValues?.get(1)?.let { AlbumRef("yandex", it) }
             hostMatches(host, "apple.com") && appleTrackId(url) == null ->
-                // .../album/<slug>/<collectionId>
-                Regex("/album/[^/]*/?(\\d+)").find(url)?.groupValues?.get(1)?.let { AlbumRef("apple", it) }
+                appleAlbumId(url)?.let { AlbumRef("apple", it) }
             hostMatches(host, "spotify.com") ->
                 Regex("/album/([A-Za-z0-9]{22})(?:[/?#]|$)").find(url)?.groupValues?.get(1)
                     ?.let { AlbumRef("spotify", it) }
@@ -251,6 +250,16 @@ class MusicResolver(
     internal fun appleTrackId(url: String): String? =
         Regex("[?&]i=(\\d+)(?:&|$)").find(url)?.groupValues?.get(1)
 
+    /**
+     * Collection id from `.../album/<slug>/<id>` or `.../album/<id>`.
+     *
+     * The id must be a whole path segment. An unanchored pattern with an optional trailing slash
+     * backtracks into a numeric slug — `/album/1999` yielded the id `9` — and would then look up
+     * an unrelated release.
+     */
+    internal fun appleAlbumId(url: String): String? =
+        Regex("/album/(?:[^/]+/)?(\\d+)(?:[/?#]|$)").find(url)?.groupValues?.get(1)
+
     private suspend fun appleLookup(url: String): TrackIdentity? {
         val id = appleTrackId(url) ?: return ogIdentity(url, bulletArtist = false)
         return appleIdLookup(url, id, entity = null)?.let { parseItunes(it) }
@@ -273,9 +282,7 @@ class MusicResolver(
      */
     private suspend fun appleSourceInOurStorefront(sourceUrl: String): String {
         if (appleUrlStorefront(sourceUrl) == appleStorefront) return sourceUrl
-        val id = appleTrackId(sourceUrl)
-            ?: Regex("/album/[^/]*/?(\\d+)").find(sourceUrl)?.groupValues?.get(1)
-            ?: return sourceUrl
+        val id = appleTrackId(sourceUrl) ?: appleAlbumId(sourceUrl) ?: return sourceUrl
         val available = web.get("https://itunes.apple.com/lookup?id=$id&country=$appleStorefront")
             ?.let { hasResults(it) } == true
         return if (available) withAppleStorefront(sourceUrl, appleStorefront) else sourceUrl
