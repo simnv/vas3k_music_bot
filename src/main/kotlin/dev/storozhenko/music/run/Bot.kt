@@ -373,14 +373,19 @@ class Bot(
         val odesilDetections = urlEntities.mapNotNull { odesilService.detect(it) }
         val links = odesilDetections.map { linkBuilder.mapOdesilResponse(it.odesilResponse) }
 
-        val playlistUrl = urlEntities.map { it.text }.firstOrNull { musicResolver.isPlaylistUrl(it) }
+        // Only when there is nothing downloadable in the message. Otherwise a message pairing a
+        // YouTube link with an album link would answer about the album and quietly drop the video
+        // the user actually asked for, after having already prefetched it.
+        val infoOnlyCandidates = if (validLinks.isEmpty()) urlEntities.map { it.text } else emptyList()
+
+        val playlistUrl = infoOnlyCandidates.firstOrNull { musicResolver.isPlaylistUrl(it) }
         if (playlistUrl != null) {
             onDetected()
             return LinkResolution(PLAYLIST_NOTE, null, infoOnly = true)
         }
 
         // Albums are answered with links only — see MusicResolver.resolveAlbum.
-        val albumUrl = urlEntities.map { it.text }
+        val albumUrl = infoOnlyCandidates
             .firstOrNull { linkBuilder.isKnownOdesliMusicUrl(it) && musicResolver.isAlbumUrl(it) }
         if (albumUrl != null) {
             onDetected()

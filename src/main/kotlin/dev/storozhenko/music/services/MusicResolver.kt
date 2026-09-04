@@ -159,10 +159,11 @@ class MusicResolver(
      */
     fun isPlaylistUrl(url: String): Boolean = runCatching {
         val host = URI(url).host?.lowercase() ?: return false
+        val path = urlPath(url) ?: return false
         when {
-            hostMatches(host, "spotify.com") -> url.contains("/playlist/")
-            hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> url.contains("/playlists/")
-            hostMatches(host, "apple.com") -> url.contains("/playlist/")
+            hostMatches(host, "spotify.com") -> path.contains("/playlist/")
+            hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> path.contains("/playlists/")
+            hostMatches(host, "apple.com") -> path.contains("/playlist/")
             else -> false
         }
     }.getOrDefault(false)
@@ -173,11 +174,11 @@ class MusicResolver(
         val host = runCatching { URI(url).host?.lowercase() }.getOrNull() ?: return null
         return when {
             (hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com")) && yandexTrackId(url) == null ->
-                Regex("/album/(\\d+)").find(url)?.groupValues?.get(1)?.let { AlbumRef("yandex", it) }
+                Regex("/album/(\\d+)").find(urlPath(url).orEmpty())?.groupValues?.get(1)?.let { AlbumRef("yandex", it) }
             hostMatches(host, "apple.com") && appleTrackId(url) == null ->
                 appleAlbumId(url)?.let { AlbumRef("apple", it) }
             hostMatches(host, "spotify.com") ->
-                Regex("/album/([A-Za-z0-9]{22})(?:[/?#]|$)").find(url)?.groupValues?.get(1)
+                Regex("/album/([A-Za-z0-9]{22})(?:[/?#]|$)").find(urlPath(url).orEmpty())?.groupValues?.get(1)
                     ?.let { AlbumRef("spotify", it) }
             else -> null
         }
@@ -248,7 +249,7 @@ class MusicResolver(
 
     /** Apple/iTunes links carry the track id in `?i=`; the keyless lookup API gives exact metadata. */
     internal fun appleTrackId(url: String): String? =
-        Regex("[?&]i=(\\d+)(?:&|$)").find(url)?.groupValues?.get(1)
+        Regex("[?&]i=(\\d+)(?:[&#]|$)").find(url)?.groupValues?.get(1)
 
     /**
      * Collection id from `.../album/<slug>/<id>` or `.../album/<id>`.
@@ -258,7 +259,12 @@ class MusicResolver(
      * an unrelated release.
      */
     internal fun appleAlbumId(url: String): String? =
-        Regex("/album/(?:[^/]+/)?(\\d+)(?:[/?#]|$)").find(url)?.groupValues?.get(1)
+        // iTunes writes the id as a path segment prefixed with "id": /album/pcd/id79674983
+        Regex("/album/(?:[^/]+/)?(?:id)?(\\d+)(?:[/?#]|$)").find(urlPath(url) ?: return null)
+            ?.groupValues?.get(1)
+
+    /** Path only. Matching the whole URL let a query string masquerade as a path segment. */
+    private fun urlPath(url: String): String? = runCatching { URI(url).path }.getOrNull()
 
     private suspend fun appleLookup(url: String): TrackIdentity? {
         val id = appleTrackId(url) ?: return ogIdentity(url, bulletArtist = false)
@@ -281,7 +287,10 @@ class MusicResolver(
      * leaving the original link alone.
      */
     private suspend fun appleSourceInOurStorefront(sourceUrl: String): String {
-        if (appleUrlStorefront(sourceUrl) == appleStorefront) return sourceUrl
+        // No storefront segment means withAppleStorefront cannot rewrite anything, so the
+        // availability lookup could not change the answer.
+        val current = appleUrlStorefront(sourceUrl) ?: return sourceUrl
+        if (current == appleStorefront) return sourceUrl
         val id = appleTrackId(sourceUrl) ?: appleAlbumId(sourceUrl) ?: return sourceUrl
         val available = web.get("https://itunes.apple.com/lookup?id=$id&country=$appleStorefront")
             ?.let { hasResults(it) } == true

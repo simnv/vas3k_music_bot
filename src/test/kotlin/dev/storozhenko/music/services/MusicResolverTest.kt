@@ -243,6 +243,28 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `accepts the itunes id-prefixed album form`() {
+        assertEquals("79674983", resolver.appleAlbumId("https://itunes.apple.com/us/album/pcd/id79674983"))
+        assertEquals("267826054", resolver.appleAlbumId("https://itunes.apple.com/album/id267826054"))
+        assertEquals("1581087024", resolver.appleAlbumId("https://music.apple.com/us/album/1581087024"))
+    }
+
+    @Test
+    fun `a fragment does not hide the track id`() {
+        assertEquals("456", resolver.appleTrackId("https://music.apple.com/gb/album/name/123?i=456#lyrics"))
+        // Otherwise the link is misread as an album and gets a non-downloadable reply.
+        assertFalse(resolver.isAlbumUrl("https://music.apple.com/gb/album/name/123?i=456#lyrics"))
+    }
+
+    @Test
+    fun `classification looks at the path, not the query string`() {
+        // A query that merely mentions another kind of URL must not change the classification.
+        assertFalse(resolver.isPlaylistUrl("https://music.apple.com/gb/album/name/123?ref=/playlist/x"))
+        assertTrue(resolver.isAlbumUrl("https://music.apple.com/gb/album/name/123?ref=/playlist/x"))
+        assertFalse(resolver.isAlbumUrl("https://music.apple.com/gb/artist/x/9?ref=/album/name/123"))
+    }
+
+    @Test
     fun `rewrites the storefront segment`() {
         assertEquals(
             "https://music.apple.com/gb/album/x/1",
