@@ -177,6 +177,26 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `an unidentifiable album still answers with the posted link`() = runTest {
+        // Better one real link than an error: the link the user sent is still a good link.
+        coEvery { web.get(any(), any(), any()) } returns null
+        val source = "https://music.apple.com/dk/album/x/6766853324"
+        val r = MusicResolver(web, ytSearch = { null }).resolveAlbum(source)!!
+        assertEquals(mapOf("Apple Music" to source), r.links)
+        assertEquals("", r.identity.title)
+        assertNull(r.youtubeUrl)
+    }
+
+    @Test
+    fun `a single service link is a good enough answer`() = runTest {
+        val source = "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"
+        coEvery { web.get(any(), any(), any()) } returns null
+        val r = MusicResolver(web, ytSearch = { null }).resolveAlbum(source)!!
+        assertEquals(1, r.links.size)
+        assertEquals(source, r.links["Spotify"])
+    }
+
+    @Test
     fun `recognises playlists, which are not albums`() {
         assertTrue(resolver.isPlaylistUrl("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"))
         assertTrue(resolver.isPlaylistUrl("https://music.yandex.ru/users/someone/playlists/1000"))
@@ -203,11 +223,51 @@ class MusicResolverTest {
             """{"resultCount":0,"results":[]}"""
         coEvery { web.get(match { it.contains("lookup") && it.contains("country=dk") }, any(), any()) } returns
             """{"resultCount":1,"results":[{"collectionName":"Half-Told Tales","artistName":"Arab Strap"}]}"""
-        coEvery { web.get(match { it.contains("entity=album") && it.contains("search") }, any(), any()) } returns
-            """{"results":[{"collectionViewUrl":"https://music.apple.com/gb/album/x/1"}]}"""
+        // The link is also checked for availability in our own storefront before being rewritten.
+        coEvery { web.get(match { it.contains("lookup") && it.contains("country=gb") }, any(), any()) } returns
+            """{"resultCount":1,"results":[{"collectionName":"Half-Told Tales"}]}"""
 
         val r = MusicResolver(web, ytSearch = { null }).resolveAlbum(source)!!
         assertEquals(TrackIdentity("Arab Strap", "Half-Told Tales"), r.identity)
+    }
+
+    @Test
+    fun `rewrites the storefront segment`() {
+        assertEquals(
+            "https://music.apple.com/gb/album/x/1",
+            resolver.withAppleStorefront("https://music.apple.com/dk/album/x/1", "gb"),
+        )
+        // Nothing to rewrite when there is no storefront segment.
+        assertEquals(
+            "https://music.apple.com/album/x/1",
+            resolver.withAppleStorefront("https://music.apple.com/album/x/1", "gb"),
+        )
+    }
+
+    @Test
+    fun `a posted apple link is converted to our storefront`() = runTest {
+        val source = "https://music.apple.com/dk/album/half-told-tales/6766853324"
+        coEvery { web.get(match { it.contains("lookup") && it.contains("country=dk") }, any(), any()) } returns
+            """{"resultCount":1,"results":[{"collectionName":"Half-Told Tales","artistName":"Arab Strap"}]}"""
+        // Available in our storefront, so the link may be rewritten.
+        coEvery { web.get(match { it.contains("lookup") && it.contains("country=gb") }, any(), any()) } returns
+            """{"resultCount":1,"results":[{"collectionName":"Half-Told Tales"}]}"""
+
+        val r = MusicResolver(web, ytSearch = { null }).resolveAlbum(source)!!
+        assertEquals("https://music.apple.com/gb/album/half-told-tales/6766853324", r.links["Apple Music"])
+    }
+
+    @Test
+    fun `the posted apple link is kept when our storefront lacks the release`() = runTest {
+        val source = "https://music.apple.com/dk/album/half-told-tales/6766853324"
+        coEvery { web.get(match { it.contains("lookup") && it.contains("country=dk") }, any(), any()) } returns
+            """{"resultCount":1,"results":[{"collectionName":"Half-Told Tales","artistName":"Arab Strap"}]}"""
+        coEvery { web.get(match { it.contains("lookup") && it.contains("country=gb") }, any(), any()) } returns
+            """{"resultCount":0,"results":[]}"""
+
+        val r = MusicResolver(web, ytSearch = { null }).resolveAlbum(source)!!
+        // Pointing at a store that does not carry it would be worse than the original link.
+        assertEquals(source, r.links["Apple Music"])
     }
 
     @Test

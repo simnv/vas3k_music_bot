@@ -55,7 +55,9 @@ class MusicResolver(
 
         val results = coroutineScope {
             // Seed each platform with the posted URL rather than searching for what we were given.
-            val apple = async { safe { sourceIfHost(sourceUrl, "apple.com") ?: searchApple(query) } }
+            val apple = async {
+                safe { sourceIfHost(sourceUrl, "apple.com")?.let { appleSourceInOurStorefront(it) } ?: searchApple(query) }
+            }
             val yandex = async { safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandex(query) } }
             val spot = async { safe { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchTrackUrl(query) } }
             val youtube = async {
@@ -105,11 +107,16 @@ class MusicResolver(
      * path. [ResolvedTrack.youtubeUrl] is always null here, which is what stops the download.
      */
     suspend fun resolveAlbum(sourceUrl: String): ResolvedTrack? {
-        val identity = identifyAlbum(sourceUrl) ?: return null
-        if (identity.query.isBlank()) return null
+        if (!isAlbumUrl(sourceUrl)) return null
+        // Failing to name the album is no reason to answer with nothing: the posted link is still a
+        // perfectly good link, so fall back to echoing it rather than reporting a failure.
+        val identity = identifyAlbum(sourceUrl)?.takeIf { it.query.isNotBlank() }
+            ?: return sourceOnly(sourceUrl)
 
         val results = coroutineScope {
-            val apple = async { safe { sourceIfHost(sourceUrl, "apple.com") ?: searchAppleAlbum(identity.query) } }
+            val apple = async {
+                safe { sourceIfHost(sourceUrl, "apple.com")?.let { appleSourceInOurStorefront(it) } ?: searchAppleAlbum(identity.query) }
+            }
             val yandex = async {
                 safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandexAlbum(identity.query) }
             }
@@ -122,9 +129,25 @@ class MusicResolver(
         yandex?.let { links["Yandex.Music"] = it }
         apple?.let { links["Apple Music"] = it }
         spotifyUrl?.let { links["Spotify"] = it }
-        if (links.isEmpty()) return null
+        if (links.isEmpty()) return sourceOnly(sourceUrl)
         return ResolvedTrack(identity, links, youtubeUrl = null)
     }
+
+    /** Last resort: the link we were given, labelled with its own service. */
+    private fun sourceOnly(sourceUrl: String): ResolvedTrack? {
+        val service = serviceName(sourceUrl) ?: return null
+        return ResolvedTrack(TrackIdentity("", ""), linkedMapOf(service to sourceUrl), youtubeUrl = null)
+    }
+
+    internal fun serviceName(url: String): String? = runCatching {
+        val host = URI(url).host?.lowercase() ?: return null
+        when {
+            hostMatches(host, "apple.com") -> "Apple Music"
+            hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> "Yandex.Music"
+            hostMatches(host, "spotify.com") -> "Spotify"
+            else -> null
+        }
+    }.getOrNull()
 
     /** An album URL is one that names an album but no track within it. */
     internal fun isAlbumUrl(url: String): Boolean = albumRef(url) != null
@@ -236,6 +259,27 @@ class MusicResolver(
     /** The storefront segment of an Apple URL, e.g. `dk` in music.apple.com/dk/album/... */
     internal fun appleUrlStorefront(url: String): String? =
         Regex("//music\\.apple\\.com/([a-z]{2})/", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)?.lowercase()
+
+    internal fun withAppleStorefront(url: String, storefront: String): String =
+        url.replace(Regex("(//music\\.apple\\.com/)[a-z]{2}/", RegexOption.IGNORE_CASE), "$1$storefront/")
+
+    /**
+     * Rewrites a posted Apple link into the configured storefront, so every Apple link the bot
+     * emits points at the same store rather than whichever one the sender happened to use.
+     *
+     * The rewrite is confirmed by an id lookup first: a release present in the sender's store is
+     * not necessarily licensed in ours, and pointing at a store that lacks it would be worse than
+     * leaving the original link alone.
+     */
+    private suspend fun appleSourceInOurStorefront(sourceUrl: String): String {
+        if (appleUrlStorefront(sourceUrl) == appleStorefront) return sourceUrl
+        val id = appleTrackId(sourceUrl)
+            ?: Regex("/album/[^/]*/?(\\d+)").find(sourceUrl)?.groupValues?.get(1)
+            ?: return sourceUrl
+        val available = web.get("https://itunes.apple.com/lookup?id=$id&country=$appleStorefront")
+            ?.let { hasResults(it) } == true
+        return if (available) withAppleStorefront(sourceUrl, appleStorefront) else sourceUrl
+    }
 
     /**
      * Looks an id up in the storefront the link came from before falling back to the default

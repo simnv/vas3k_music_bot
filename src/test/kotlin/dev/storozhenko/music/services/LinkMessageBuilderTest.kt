@@ -169,6 +169,18 @@ class LinkMessageBuilderTest {
     }
 
     @Test
+    fun `an unnamed release renders without a blank first line`() {
+        val track = ResolvedTrack(
+            TrackIdentity("", ""),
+            linkedMapOf("Apple Music" to "https://music.apple.com/gb/album/x/1"),
+            youtubeUrl = null,
+        )
+        val out = builder.formatResolved(track, linkPrefix = "\uD83D\uDCBF ")
+        assertTrue(out.startsWith("\uD83D\uDCBF <a href="), "got: $out")
+        assertFalse(out.startsWith("\n"))
+    }
+
+    @Test
     fun `escapes ampersands inside link urls`() {
         // iTunes trackViewUrl carries &uo=4, which must not terminate the href attribute early.
         val track = ResolvedTrack(

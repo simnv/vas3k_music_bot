@@ -42,7 +42,8 @@ class LinkMessageBuilder {
         val links = track.links.entries.joinToString(" | ") { (platform, url) ->
             "<a href=\"${escapeHtml(url)}\">${escapeHtml(platform)}</a>"
         }
-        return "${escapeHtml(name)}\n$linkPrefix$links"
+        // An unnamed release would otherwise render with a blank first line.
+        return if (name.isBlank()) "$linkPrefix$links" else "${escapeHtml(name)}\n$linkPrefix$links"
     }
 
     internal fun escapeHtml(s: String): String =
