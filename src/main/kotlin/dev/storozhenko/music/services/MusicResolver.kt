@@ -166,8 +166,7 @@ class MusicResolver(
         return when (ref.service) {
             "yandex" -> web.get("https://api.music.yandex.net/albums/${ref.id}", useProxy = true)
                 ?.let { parseYandexAlbum(it) }
-            "apple" -> web.get("https://itunes.apple.com/lookup?id=${ref.id}&entity=album")
-                ?.let { parseItunesAlbum(it) }
+            "apple" -> appleIdLookup(url, ref.id, "album")?.let { parseItunesAlbum(it) }
             "spotify" -> spotify?.albumIdentity(ref.id)
             else -> null
         }
@@ -231,9 +230,31 @@ class MusicResolver(
 
     private suspend fun appleLookup(url: String): TrackIdentity? {
         val id = appleTrackId(url) ?: return ogIdentity(url, bulletArtist = false)
-        val body = web.get("https://itunes.apple.com/lookup?id=$id") ?: return null
-        return parseItunes(body)
+        return appleIdLookup(url, id, entity = null)?.let { parseItunes(it) }
     }
+
+    /** The storefront segment of an Apple URL, e.g. `dk` in music.apple.com/dk/album/... */
+    internal fun appleUrlStorefront(url: String): String? =
+        Regex("//music\\.apple\\.com/([a-z]{2})/", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)?.lowercase()
+
+    /**
+     * Looks an id up in the storefront the link came from before falling back to the default
+     * catalogue. A release can be absent from the US store while existing in the one the user
+     * linked — `/dk/album/half-told-tales` returns nothing without `country=dk`, which made the bot
+     * claim it could not find an album that was right there in the URL.
+     */
+    private suspend fun appleIdLookup(sourceUrl: String, id: String, entity: String?): String? {
+        val suffix = entity?.let { "&entity=$it" }.orEmpty()
+        appleUrlStorefront(sourceUrl)?.let { store ->
+            web.get("https://itunes.apple.com/lookup?id=$id$suffix&country=$store")
+                ?.takeIf { hasResults(it) }
+                ?.let { return it }
+        }
+        return web.get("https://itunes.apple.com/lookup?id=$id$suffix")?.takeIf { hasResults(it) }
+    }
+
+    private fun hasResults(body: String): Boolean =
+        runCatching { mapper.readTree(body).path("resultCount").asInt(0) > 0 }.getOrDefault(false)
 
     /**
      * Spotify pages are JS-rendered with no og: tags. With credentials the Web API gives artist and

@@ -187,6 +187,30 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `reads the storefront out of an apple url`() {
+        assertEquals("dk", resolver.appleUrlStorefront("https://music.apple.com/dk/album/half-told-tales/6766853324"))
+        assertEquals("ru", resolver.appleUrlStorefront("https://music.apple.com/ru/album/x/1?i=2"))
+        assertNull(resolver.appleUrlStorefront("https://music.apple.com/album/x/1"))
+        assertNull(resolver.appleUrlStorefront("https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"))
+    }
+
+    @Test
+    fun `album lookup uses the storefront from the posted link`() = runTest {
+        // /dk/ album absent from the default catalogue: without country=dk the lookup returns
+        // resultCount 0 and the bot claimed it could not find an album named in the URL.
+        val source = "https://music.apple.com/dk/album/half-told-tales/6766853324"
+        coEvery { web.get(match { it.contains("lookup") && !it.contains("country=") }, any(), any()) } returns
+            """{"resultCount":0,"results":[]}"""
+        coEvery { web.get(match { it.contains("lookup") && it.contains("country=dk") }, any(), any()) } returns
+            """{"resultCount":1,"results":[{"collectionName":"Half-Told Tales","artistName":"Arab Strap"}]}"""
+        coEvery { web.get(match { it.contains("entity=album") && it.contains("search") }, any(), any()) } returns
+            """{"results":[{"collectionViewUrl":"https://music.apple.com/gb/album/x/1"}]}"""
+
+        val r = MusicResolver(web, ytSearch = { null }).resolveAlbum(source)!!
+        assertEquals(TrackIdentity("Arab Strap", "Half-Told Tales"), r.identity)
+    }
+
+    @Test
     fun `extracts the yandex track id`() {
         assertEquals("153933899", resolver.yandexTrackId("https://music.yandex.ru/album/43183857/track/153933899"))
         assertNull(resolver.yandexTrackId("https://music.yandex.ru/album/43183857"))

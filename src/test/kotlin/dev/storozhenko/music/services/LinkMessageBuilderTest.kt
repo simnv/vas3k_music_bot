@@ -157,6 +157,18 @@ class LinkMessageBuilderTest {
     }
 
     @Test
+    fun `link prefix marks the message without adding a sentence`() {
+        val track = ResolvedTrack(
+            TrackIdentity("Chat Pile", "Who Loves The Sun"),
+            linkedMapOf("Apple Music" to "https://music.apple.com/gb/album/x/1"),
+            youtubeUrl = null,
+        )
+        val out = builder.formatResolved(track, linkPrefix = "\uD83D\uDCBF ")
+        assertEquals("Chat Pile - Who Loves The Sun", out.lineSequence().first())
+        assertTrue(out.lineSequence().last().startsWith("\uD83D\uDCBF <a href="))
+    }
+
+    @Test
     fun `escapes ampersands inside link urls`() {
         // iTunes trackViewUrl carries &uo=4, which must not terminate the href attribute early.
         val track = ResolvedTrack(

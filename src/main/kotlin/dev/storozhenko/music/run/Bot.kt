@@ -213,7 +213,7 @@ class Bot(
     }
 
     private companion object {
-        const val ALBUM_NOTE = "Это альбом — скачиваю только отдельные треки."
+        const val ALBUM_EMOJI = "\uD83D\uDCBF"
         const val PLAYLIST_NOTE = "Плейлисты не поддерживаются — пришлите ссылку на трек или альбом."
     }
 
@@ -386,9 +386,10 @@ class Bot(
             onDetected()
             val album = musicResolver.resolveAlbum(albumUrl)
             return if (album != null) {
-                LinkResolution(linkBuilder.formatResolved(album) + "\n\n$ALBUM_NOTE", null, infoOnly = true)
+                // The disc marks it as an album, so no sentence is needed to say nothing was downloaded.
+                LinkResolution(linkBuilder.formatResolved(album, linkPrefix = "$ALBUM_EMOJI "), null, infoOnly = true)
             } else {
-                LinkResolution("❌ Не удалось найти этот альбом.", null, infoOnly = true)
+                LinkResolution("$ALBUM_EMOJI Альбом не найден на других сервисах.", null, infoOnly = true)
             }
         }
 

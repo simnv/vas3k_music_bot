@@ -35,14 +35,14 @@ class LinkMessageBuilder {
      * escaped — an apostrophe or ampersand in a track name would otherwise break Telegram's HTML
      * parse mode and drop the whole message.
      */
-    fun formatResolved(track: ResolvedTrack): String {
+    fun formatResolved(track: ResolvedTrack, linkPrefix: String = ""): String {
         val name = listOf(track.identity.artist, track.identity.title)
             .filter { it.isNotBlank() }
             .joinToString(" - ")
         val links = track.links.entries.joinToString(" | ") { (platform, url) ->
             "<a href=\"${escapeHtml(url)}\">${escapeHtml(platform)}</a>"
         }
-        return "${escapeHtml(name)}\n$links"
+        return "${escapeHtml(name)}\n$linkPrefix$links"
     }
 
     internal fun escapeHtml(s: String): String =
