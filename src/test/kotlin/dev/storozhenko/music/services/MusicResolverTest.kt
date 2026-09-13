@@ -197,6 +197,48 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `a youtube music OLAK playlist is an album, not a playlist`() {
+        val album = "https://music.youtube.com/playlist?list=OLAK5uy_kRZKrpwDvOSyZ6bVJVgw12Uq0S_4bObBE"
+        assertTrue(resolver.isYoutubeAlbumPlaylist(album))
+        assertFalse(resolver.isPlaylistUrl(album))
+        // An ordinary playlist is still a playlist.
+        val ordinary = "https://www.youtube.com/playlist?list=PLynGE1TVSPnGSVvpO4Xt4d0z4RM5DgLKF"
+        assertFalse(resolver.isYoutubeAlbumPlaylist(ordinary))
+        assertTrue(resolver.isPlaylistUrl(ordinary))
+        // A watch URL carrying a list is a video, not a playlist.
+        assertFalse(resolver.isPlaylistUrl("https://www.youtube.com/watch?v=x&list=OLAK5uy_abc"))
+        assertFalse(resolver.isYoutubeAlbumPlaylist("https://www.youtube.com/watch?v=x&list=OLAK5uy_abc"))
+    }
+
+    @Test
+    fun `strips the youtube music release-type prefix`() {
+        assertEquals("Anatomy Of A Brief Romance", resolver.cleanYoutubeAlbumTitle("Album - Anatomy Of A Brief Romance"))
+        assertEquals("Some EP", resolver.cleanYoutubeAlbumTitle("EP - Some EP"))
+        assertEquals("One Thing", resolver.cleanYoutubeAlbumTitle("Single - One Thing"))
+        // A dash inside the name itself must survive.
+        assertEquals("Songs - Volume 2", resolver.cleanYoutubeAlbumTitle("Album - Songs - Volume 2"))
+        assertEquals("Plain Title", resolver.cleanYoutubeAlbumTitle("Plain Title"))
+    }
+
+    @Test
+    fun `a youtube album resolves to links and never to a download`() = runTest {
+        val source = "https://music.youtube.com/playlist?list=OLAK5uy_abc"
+        coEvery { web.get(match { it.contains("entity=album") }, any(), any()) } returns
+            """{"results":[{"collectionViewUrl":"https://music.apple.com/gb/album/x/1"}]}"""
+        coEvery { web.get(match { it.contains("api.music.yandex.net/search") }, any(), any()) } returns
+            """{"result":{"albums":{"results":[{"id":77}]}}}"""
+
+        val r = MusicResolver(web, ytSearch = { "https://youtu.be/should-not-be-used" })
+            .resolveAlbumFor(TrackIdentity("Bloc Party", "Anatomy Of A Brief Romance"), source)!!
+
+        assertNull(r.youtubeUrl)
+        assertEquals("https://music.apple.com/gb/album/x/1", r.links["Apple Music"])
+        assertEquals("https://music.yandex.ru/album/77", r.links["Yandex.Music"])
+        // The posted link is kept, labelled as its own service.
+        assertEquals(source, r.links["YouTube Music"])
+    }
+
+    @Test
     fun `recognises playlists, which are not albums`() {
         assertTrue(resolver.isPlaylistUrl("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"))
         assertTrue(resolver.isPlaylistUrl("https://music.yandex.ru/users/someone/playlists/1000"))

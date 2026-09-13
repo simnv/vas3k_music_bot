@@ -112,6 +112,15 @@ class MusicResolver(
         // perfectly good link, so fall back to echoing it rather than reporting a failure.
         val identity = identifyAlbum(sourceUrl)?.takeIf { it.query.isNotBlank() }
             ?: return sourceOnly(sourceUrl)
+        return resolveAlbumFor(identity, sourceUrl)
+    }
+
+    /**
+     * Album stage two on its own, for a release we can already name — a YouTube Music album
+     * playlist, where yt-dlp has given us the album title and the artist.
+     */
+    suspend fun resolveAlbumFor(identity: TrackIdentity, sourceUrl: String): ResolvedTrack? {
+        if (identity.query.isBlank()) return sourceOnly(sourceUrl)
 
         val results = coroutineScope {
             val apple = async {
@@ -129,6 +138,8 @@ class MusicResolver(
         yandex?.let { links["Yandex.Music"] = it }
         apple?.let { links["Apple Music"] = it }
         spotifyUrl?.let { links["Spotify"] = it }
+        // The posted link belongs in the list too when no search covered its own service.
+        serviceName(sourceUrl)?.let { links.putIfAbsent(it, sourceUrl) }
         if (links.isEmpty()) return sourceOnly(sourceUrl)
         return ResolvedTrack(identity, links, youtubeUrl = null)
     }
@@ -145,6 +156,7 @@ class MusicResolver(
             hostMatches(host, "apple.com") -> "Apple Music"
             hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> "Yandex.Music"
             hostMatches(host, "spotify.com") -> "Spotify"
+            hostMatches(host, "youtube.com") || hostMatches(host, "youtu.be") -> "YouTube Music"
             else -> null
         }
     }.getOrNull()
@@ -157,13 +169,30 @@ class MusicResolver(
      * look up on the other services. Detected only to answer clearly instead of reporting that a
      * track could not be found.
      */
+    /**
+     * YouTube Music names album playlists with an OLAK5uy_ id. They are releases, not personal
+     * selections, so they take the album path rather than the rejection.
+     */
+    fun isYoutubeAlbumPlaylist(url: String): Boolean = runCatching {
+        val host = URI(url).host?.lowercase() ?: return false
+        if (!hostMatches(host, "youtube.com") && !hostMatches(host, "youtu.be")) return false
+        if (urlPath(url)?.startsWith("/playlist") != true) return false
+        Regex("[?&]list=(OLAK5uy_[A-Za-z0-9_-]+)").containsMatchIn(url)
+    }.getOrDefault(false)
+
+    /** Strips the "Album - " / "Single - " / "EP - " prefix YouTube Music puts on these titles. */
+    internal fun cleanYoutubeAlbumTitle(title: String): String =
+        title.replace(Regex("^(Album|Single|EP)\\s+-\\s+", RegexOption.IGNORE_CASE), "").trim()
+
     fun isPlaylistUrl(url: String): Boolean = runCatching {
         val host = URI(url).host?.lowercase() ?: return false
         val path = urlPath(url) ?: return false
+        if (isYoutubeAlbumPlaylist(url)) return false
         when {
             hostMatches(host, "spotify.com") -> path.contains("/playlist/")
             hostMatches(host, "yandex.ru") || hostMatches(host, "yandex.com") -> path.contains("/playlists/")
             hostMatches(host, "apple.com") -> path.contains("/playlist/")
+            hostMatches(host, "youtube.com") || hostMatches(host, "youtu.be") -> path.startsWith("/playlist")
             else -> false
         }
     }.getOrDefault(false)

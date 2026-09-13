@@ -17,7 +17,9 @@ class UrlValidator {
         "youtube" to DomainConfig(
             hosts = setOf("youtube.com", "youtu.be"),
             allowedPaths = setOf("/watch", "/shorts/", "/embed/", "/v/", "/"),
-            blockedPathPrefixes = setOf("/post/")
+            // A playlist is not one downloadable thing. It used to slip through on the "/" prefix
+            // and yt-dlp quietly took item 1, so an album link returned one arbitrary track.
+            blockedPathPrefixes = setOf("/post/", "/playlist")
         ),
         "tiktok" to DomainConfig(
             hosts = setOf("tiktok.com", "vt.tiktok.com"),

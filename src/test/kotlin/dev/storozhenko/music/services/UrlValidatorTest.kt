@@ -8,6 +8,15 @@ class UrlValidatorTest {
     private val validator = UrlValidator()
 
     @Test
+    fun `youtube playlists are not downloadable`() {
+        // yt-dlp used to take item 1, so an album link returned one arbitrary track.
+        assertFalse(validator.isValidDownloadUrl("https://music.youtube.com/playlist?list=OLAK5uy_abc"))
+        assertFalse(validator.isValidDownloadUrl("https://www.youtube.com/playlist?list=PL123"))
+        // A watch URL carrying a list is still a single video.
+        assertTrue(validator.isValidDownloadUrl("https://www.youtube.com/watch?v=abc&list=PL123"))
+    }
+
+    @Test
     fun `accepts known video hosts`() {
         assertTrue(validator.isValidDownloadUrl("https://www.youtube.com/watch?v=abc"))
         assertTrue(validator.isValidDownloadUrl("https://youtu.be/abc"))

@@ -378,6 +378,23 @@ class Bot(
         // the user actually asked for, after having already prefetched it.
         val infoOnlyCandidates = if (validLinks.isEmpty()) urlEntities.map { it.text } else emptyList()
 
+        // A YouTube Music OLAK5uy_ playlist is a release, so it gets the album treatment rather
+        // than the rejection. yt-dlp names it for us, so there is nothing to identify from a page.
+        val ytAlbumUrl = infoOnlyCandidates.firstOrNull { musicResolver.isYoutubeAlbumPlaylist(it) }
+        if (ytAlbumUrl != null) {
+            onDetected()
+            val meta = downloader.getPlaylistMeta(ytAlbumUrl)
+            val identity = meta?.let {
+                TrackIdentity(it.uploader.orEmpty(), musicResolver.cleanYoutubeAlbumTitle(it.title))
+            } ?: TrackIdentity("", "")
+            val album = musicResolver.resolveAlbumFor(identity, ytAlbumUrl)
+            return if (album != null) {
+                LinkResolution(linkBuilder.formatResolved(album, linkPrefix = "$ALBUM_EMOJI "), null, infoOnly = true)
+            } else {
+                LinkResolution("$ALBUM_EMOJI Альбом не найден на других сервисах.", null, infoOnly = true)
+            }
+        }
+
         val playlistUrl = infoOnlyCandidates.firstOrNull { musicResolver.isPlaylistUrl(it) }
         if (playlistUrl != null) {
             onDetected()

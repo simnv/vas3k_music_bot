@@ -19,6 +19,9 @@ import java.util.UUID
 
 data class VideoMeta(val title: String, val durationSec: Int?)
 
+/** Playlist-level metadata, read without resolving every entry. */
+data class PlaylistMeta(val title: String, val uploader: String?, val count: Int?)
+
 class DownloadService(
     private val ytdlLocation: String,
     private val virtualDispatcher: CoroutineDispatcher,
@@ -204,6 +207,32 @@ class DownloadService(
             logger.error("ytsearch failed for $query", e)
             null
         }
+    }
+
+    /**
+     * Playlist title, uploader and length via --flat-playlist, which does not resolve the entries.
+     * Resolving them is what made a plain metadata call on an album playlist take 90 seconds.
+     */
+    suspend fun getPlaylistMeta(url: String): PlaylistMeta? = runInterruptible(virtualDispatcher) {
+        val command = listOf(
+            ytdlLocation, "--cookies", "/cookies.txt",
+            "--flat-playlist", "--playlist-items", "1", "--skip-download",
+            "--print", "%(playlist_title)s\t%(uploader)s\t%(playlist_count)s",
+        ) + getProxyParams(url) + listOf(url)
+        logger.info(command.shellJoin())
+        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        val lines = BufferedReader(InputStreamReader(process.inputStream)).use { it.readLines() }
+        process.waitFor()
+        logger.info("Playlist meta: ${lines.joinToString(" | ")}")
+        val printed = lines.firstOrNull { it.contains('\t') } ?: return@runInterruptible null
+        val parts = printed.split("\t")
+        val title = parts.getOrNull(0).orEmpty().takeIf { it.isNotBlank() && it != "NA" }
+            ?: return@runInterruptible null
+        PlaylistMeta(
+            title = title,
+            uploader = parts.getOrNull(1)?.takeIf { it.isNotBlank() && it != "NA" },
+            count = parts.getOrNull(2)?.toIntOrNull(),
+        )
     }
 
     suspend fun getVideoMeta(url: String): VideoMeta = runInterruptible(virtualDispatcher) {
