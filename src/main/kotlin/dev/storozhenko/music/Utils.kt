@@ -30,6 +30,12 @@ fun String.split2ByDash(reverseIfSingle: Boolean = false): Pair<String, String> 
     }
 }
 
+/**
+ * Drops the "[mm:ss]" the message appends for display. It belongs to the chat text, not to the
+ * track, and leaving it in put the running time inside the audio title tag.
+ */
+fun String.stripDisplayDuration(): String = replace(Regex("\\s*\\[\\d{1,3}:\\d{2}\\]\\s*$"), "")
+
 fun String.removeFirstLine(): String = this.lineSequence().drop(1).joinToString("\n")
 
 fun File.changeExtension(newExtension: String): File =

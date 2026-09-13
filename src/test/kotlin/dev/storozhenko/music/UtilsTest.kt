@@ -104,6 +104,17 @@ class UtilsTest {
         assertFalse(shouldForceAudio(parseRequestOptions("https://youtu.be/x high"), musicOnlySource = false))
     }
 
+    @Test
+    fun `strips the display duration from a title`() {
+        assertEquals("Depeche Mode - Walking In My Shoes (Live on Letterman)",
+            "Depeche Mode - Walking In My Shoes (Live on Letterman) [06:31]".stripDisplayDuration())
+        assertEquals("Song", "Song [00:07]".stripDisplayDuration())
+        assertEquals("Song", "Song [100:00]".stripDisplayDuration())
+        // Only a trailing timestamp goes; other bracketed text is part of the name.
+        assertEquals("[Full Album] Band", "[Full Album] Band".stripDisplayDuration())
+        assertEquals("Track [Remix]", "Track [Remix]".stripDisplayDuration())
+    }
+
     // split2ByDash
     @Test
     fun `splits artist and title on first dash`() {

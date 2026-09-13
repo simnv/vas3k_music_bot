@@ -86,6 +86,24 @@ class TelegramSender(
         }
     }
 
+    /**
+     * Name for the uploaded audio.
+     *
+     * The upload used to be called "audio" with no extension. Telegram cannot read the format from
+     * such a name, so it fell back to showing the name itself and ignored the performer and title
+     * tags — a track arrived labelled "audio". The extension must be real, and naming the file
+     * after the track also makes it sensible once saved.
+     */
+    internal fun audioFileName(artist: String, title: String, audioFile: File): String {
+        val base = listOf(artist, title)
+            .filter { it.isNotBlank() }
+            .joinToString(" - ")
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .trim()
+        val extension = audioFile.extension.ifBlank { "m4a" }
+        return if (base.isBlank()) "audio.$extension" else "$base.$extension"
+    }
+
     suspend fun sendAudioInPlace(
         audioFile: File,
         chatId: Long,
@@ -96,7 +114,7 @@ class TelegramSender(
         duration: Int? = null,
         thumbnailFile: File? = null
     ) {
-        val audioMedia = InputMediaAudio(audioFile, "audio").also {
+        val audioMedia = InputMediaAudio(audioFile, audioFileName(artist, title, audioFile)).also {
             it.caption = caption
             it.parseMode = "HTML"
             it.performer = artist
