@@ -63,20 +63,25 @@ class DownloadService(
             "-f", formatSelector, "--merge-output-format", "mp4", "--write-info-json",
         )
 
-    /**
-     * The trailing `/best` and the extraction step are not optional. YouTube can serve a video with
-     * no audio-only stream at all — every format list checked on 2026-09-16 held exactly one
-     * combined format — and without them the selector matched nothing, so audio failed outright
-     * while video fell back to the same combined format and kept working.
-     *
-     * `-x` copies the audio stream when the codec already suits the container, so the normal case
-     * where a real audio-only m4a exists is not re-encoded.
-     */
+    /** Preferred: a real audio-only stream, which is both the best audio and the smallest download. */
     fun audioFlags(url: String): List<String> =
         commonYtDlpFlags(url) + listOf(
-            "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
-            "-x", "--audio-format", "m4a",
+            "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio",
             "--print", "before_dl:[QUALITY] source: id=%(format_id)s codec=%(acodec)s abr=%(abr)skbps asr=%(asr)sHz ext=%(ext)s"
+        )
+
+    /**
+     * Used only after [audioFlags] fails. YouTube sometimes offers no audio-only stream at all —
+     * on 2026-09-16 every format was a combined HLS rendition — and the audio-only selector then
+     * matches nothing, so audio failed while video fell back within its own selector.
+     *
+     * Capped at 480p on purpose: every rendition of such a video carries the same mp4a.40.2 audio,
+     * so taking the 1080p one would download 119MB instead of 22MB for identical sound.
+     */
+    fun audioFallbackFlags(url: String): List<String> =
+        commonYtDlpFlags(url) + listOf(
+            "-f", "best[height<=480]/best",
+            "-x", "--audio-format", "m4a",
         )
 
     fun commonYtDlpFlags(url: String): List<String> = buildList {

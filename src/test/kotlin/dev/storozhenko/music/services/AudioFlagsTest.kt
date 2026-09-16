@@ -21,15 +21,21 @@ class AudioFlagsTest {
     )
 
     @Test
-    fun `audio selector falls back to a combined format`() {
-        val selector = service.audioFlags("https://youtu.be/x").let { it[it.indexOf("-f") + 1] }
-        assertTrue(selector.endsWith("/best"), "no combined-format fallback: $selector")
-        assertTrue(selector.startsWith("bestaudio[ext=m4a]"), "audio-only must still be preferred: $selector")
+    fun `the preferred selector asks only for audio-only streams`() {
+        val flags = service.audioFlags("https://youtu.be/x")
+        val selector = flags[flags.indexOf("-f") + 1]
+        assertTrue(selector.startsWith("bestaudio[ext=m4a]"), "audio-only must be preferred: $selector")
+        // No /best here: a combined format would pull the whole video on the happy path.
+        assertTrue(!selector.contains("/best\"") && !selector.endsWith("/best"), "unexpected fallback: $selector")
+        assertTrue(!flags.contains("-x"), "nothing to extract from an audio-only stream")
     }
 
     @Test
-    fun `audio flags extract to an audio container`() {
-        val flags = service.audioFlags("https://youtu.be/x")
+    fun `the fallback takes audio out of a capped combined format`() {
+        val flags = service.audioFallbackFlags("https://youtu.be/x")
+        val selector = flags[flags.indexOf("-f") + 1]
+        // Every rendition carries the same audio, so the 1080p one would be a wasted download.
+        assertTrue(selector.contains("height<=480"), "fallback must stay small: $selector")
         assertTrue(flags.contains("-x"), "a combined format would otherwise be sent as video")
         assertTrue(flags.windowed(2).contains(listOf("--audio-format", "m4a")))
     }

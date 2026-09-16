@@ -72,6 +72,15 @@ class DownloadPipeline(
             pulser.set("typing")
             reporter.status("Downloading audio...")
             downloadedFile = awaitOrDownload(prefetchedUrl, prefetchedDownload, url, downloader.audioFlags(url))
+                ?: run {
+                    // No audio-only stream on offer: take the audio out of a combined one instead.
+                    logger.info("Audio-only download failed for $url, retrying from a combined format")
+                    reporter.status("Retrying audio...")
+                    downloader.download(
+                        "${UUID.randomUUID()}.%(ext)s", url,
+                        *downloader.audioFallbackFlags(url).toTypedArray(),
+                    )
+                }
                 ?: run { reporter.fail("Failed to download audio: empty result"); return false }
 
             thumbnailFile = downloader.resolveSiblingThumbnail(downloadedFile)
