@@ -63,9 +63,19 @@ class DownloadService(
             "-f", formatSelector, "--merge-output-format", "mp4", "--write-info-json",
         )
 
+    /**
+     * The trailing `/best` and the extraction step are not optional. YouTube can serve a video with
+     * no audio-only stream at all — every format list checked on 2026-09-16 held exactly one
+     * combined format — and without them the selector matched nothing, so audio failed outright
+     * while video fell back to the same combined format and kept working.
+     *
+     * `-x` copies the audio stream when the codec already suits the container, so the normal case
+     * where a real audio-only m4a exists is not re-encoded.
+     */
     fun audioFlags(url: String): List<String> =
         commonYtDlpFlags(url) + listOf(
-            "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio",
+            "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+            "-x", "--audio-format", "m4a",
             "--print", "before_dl:[QUALITY] source: id=%(format_id)s codec=%(acodec)s abr=%(abr)skbps asr=%(asr)sHz ext=%(ext)s"
         )
 
