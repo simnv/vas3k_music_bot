@@ -1,5 +1,7 @@
 package dev.storozhenko.music.services
 
+import java.text.Normalizer
+
 /**
  * Checks a search hit against the release we searched for.
  *
@@ -29,13 +31,29 @@ internal object SearchMatch {
     }
 
     internal fun normalize(s: String): String {
-        val lower = s.lowercase()
+        val lower = fold(s.lowercase())
         val undecorated = lower
             .replace(Regex("\\([^)]*\\)|\\[[^]]*]"), " ")
             .replace(Regex("\\s(feat|ft|featuring)\\.?\\s.*$"), " ")
         // A title made only of brackets would normalize to nothing; keep its words instead.
         return words(undecorated).ifEmpty { words(lower) }
     }
+
+    /**
+     * Services disagree on diacritics: one writes "Sigur Rós", another "Sigur Ros". NFKD splits
+     * "ó" into "o" and a combining mark, and also turns full-width "Ａ" into "A". Letters that do
+     * not decompose are mapped by hand.
+     */
+    private fun fold(s: String): String =
+        Normalizer.normalize(s, Normalizer.Form.NFKD)
+            .replace(Regex("\\p{M}+"), "")
+            .let { decomposed -> buildString { decomposed.forEach { append(LETTERS[it] ?: it) } } }
+            .replace("&", " and ")
+
+    private val LETTERS = mapOf(
+        'ø' to "o", 'ß' to "ss", 'æ' to "ae", 'œ' to "oe", 'ł' to "l", 'đ' to "d", 'ð' to "d",
+        'þ' to "th", 'ı' to "i", 'ħ' to "h",
+    )
 
     /** "T.N.T." and "TNT" are the same word; "AC/DC" and "AC-DC" are the same two. */
     private fun words(s: String): String =

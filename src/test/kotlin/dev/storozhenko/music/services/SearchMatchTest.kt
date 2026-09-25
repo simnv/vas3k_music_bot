@@ -50,6 +50,19 @@ class SearchMatchTest {
     }
 
     @Test
+    fun `diacritics and letter variants do not prevent a match`() {
+        assertTrue(SearchMatch.matches(TrackIdentity("Beyoncé", "Café"), "Cafe", listOf("Beyonce")))
+        assertTrue(SearchMatch.matches(TrackIdentity("Sigur Ros", "Hoppipolla"), "Hoppípolla", listOf("Sigur Rós")))
+        assertTrue(SearchMatch.matches(TrackIdentity("Mø", "Final Song"), "Final Song", listOf("MO")))
+        assertTrue(SearchMatch.matches(TrackIdentity("Die Ärzte", "Straße"), "Strasse", listOf("Die Arzte")))
+        assertTrue(SearchMatch.matches(TrackIdentity("Łona", "Æther"), "Aether", listOf("Lona")))
+        // Full-width forms, as some Japanese releases are titled.
+        assertTrue(SearchMatch.matches(TrackIdentity("", "ＡＢＣ"), "ABC", emptyList()))
+        assertTrue(SearchMatch.matches(TrackIdentity("Земфира", "Ёлка"), "Елка", listOf("Земфира")))
+        assertTrue(SearchMatch.matches(TrackIdentity("Simon & Garfunkel", "Mrs. Robinson"), "Mrs Robinson", listOf("Simon and Garfunkel")))
+    }
+
+    @Test
     fun `cyrillic titles are compared`() {
         assertTrue(SearchMatch.matches(TrackIdentity("BEARWOLF", "Владивосток"), "Владивосток", listOf("BEARWOLF")))
         assertFalse(SearchMatch.matches(TrackIdentity("BEARWOLF", "Владивосток"), "Москва", listOf("BEARWOLF")))
