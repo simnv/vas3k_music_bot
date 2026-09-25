@@ -63,6 +63,26 @@ class SearchMatchTest {
     }
 
     @Test
+    fun `a field written in another script is trusted`() {
+        // "Земфира" and "Zemfira" cannot be compared as text, so the service's ranking decides.
+        assertTrue(SearchMatch.matches(TrackIdentity("Земфира", "Хочешь"), "Hochesh", listOf("Zemfira")))
+        assertTrue(SearchMatch.matches(TrackIdentity("Zemfira", "Hochesh"), "Хочешь?", listOf("Земфира")))
+        assertTrue(SearchMatch.matches(TrackIdentity("Yoasobi", "Yoru ni Kakeru"), "夜に駆ける", listOf("YOASOBI")))
+    }
+
+    @Test
+    fun `a field in the same script is still checked when the other is trusted`() {
+        // The title cannot be compared, but the artist can, and it is wrong.
+        assertFalse(SearchMatch.matches(TrackIdentity("Zemfira", "Хочешь"), "Hochesh", listOf("Polyphia")))
+    }
+
+    @Test
+    fun `a shared script means a strict comparison`() {
+        // Both sides carry Latin letters, so they are compared as usual.
+        assertFalse(SearchMatch.matches(TrackIdentity("Zemfira", "Hochesh (Хочешь)"), "Iskala", listOf("Zemfira")))
+    }
+
+    @Test
     fun `cyrillic titles are compared`() {
         assertTrue(SearchMatch.matches(TrackIdentity("BEARWOLF", "Владивосток"), "Владивосток", listOf("BEARWOLF")))
         assertFalse(SearchMatch.matches(TrackIdentity("BEARWOLF", "Владивосток"), "Москва", listOf("BEARWOLF")))

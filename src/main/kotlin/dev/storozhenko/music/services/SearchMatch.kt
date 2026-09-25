@@ -15,12 +15,32 @@ import java.text.Normalizer
 internal object SearchMatch {
 
     fun matches(wanted: TrackIdentity, title: String, artists: List<String>): Boolean {
-        if (!overlaps(normalize(wanted.title), normalize(title))) return false
+        if (!sameField(normalize(wanted.title), normalize(title))) return false
         val artist = normalize(wanted.artist)
         // Nothing to compare: an identity without an artist, or a hit whose artists we did not read.
         if (artist.isEmpty() || artists.isEmpty()) return true
-        return artists.any { overlaps(artist, normalize(it)) }
+        return artists.any { sameField(artist, normalize(it)) }
     }
+
+    /**
+     * "Земфира" and "Zemfira" cannot be compared as text. When two values share no script at all,
+     * the service's own ranking is trusted instead: a wrong link is possible there, but a strict
+     * check would drop every correct one.
+     */
+    private fun sameField(a: String, b: String): Boolean = overlaps(a, b) || differentScripts(a, b)
+
+    private fun differentScripts(a: String, b: String): Boolean {
+        val x = scripts(a)
+        val y = scripts(b)
+        return x.isNotEmpty() && y.isNotEmpty() && x.none { it in y }
+    }
+
+    private fun scripts(s: String): Set<Character.UnicodeScript> =
+        s.codePoints().toArray()
+            .filter { Character.isLetter(it) }
+            .map { Character.UnicodeScript.of(it) }
+            .filter { it != Character.UnicodeScript.COMMON && it != Character.UnicodeScript.INHERITED }
+            .toSet()
 
     /** True when one side contains the other as whole words. */
     private fun overlaps(a: String, b: String): Boolean {
