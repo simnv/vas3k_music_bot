@@ -115,6 +115,15 @@ class UtilsTest {
         assertEquals("Track [Remix]", "Track [Remix]".stripDisplayDuration())
     }
 
+    @Test
+    fun `reads the track name from the html message it was rendered into`() {
+        // The chat message is HTML, so "&" arrives as "&amp;"; the audio tags are plain text.
+        assertEquals("Bicep & Soarr" to "Air",
+            trackNameFromMessage("Bicep &amp; Soarr - Air [03:40]\n<a href=\"x\">YouTube</a>"))
+        assertEquals("Guns N' Roses" to "<Live>", trackNameFromMessage("Guns N&#39; Roses - &lt;Live&gt;"))
+        assertEquals("" to "Song", trackNameFromMessage("Song"))
+    }
+
     // split2ByDash
     @Test
     fun `splits artist and title on first dash`() {

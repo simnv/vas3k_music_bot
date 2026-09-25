@@ -3,6 +3,7 @@ package dev.storozhenko.music
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.jsoup.parser.Parser
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -35,6 +36,15 @@ fun String.split2ByDash(reverseIfSingle: Boolean = false): Pair<String, String> 
  * track, and leaving it in put the running time inside the audio title tag.
  */
 fun String.stripDisplayDuration(): String = replace(Regex("\\s*\\[\\d{1,3}:\\d{2}\\]\\s*$"), "")
+
+/**
+ * Artist and title from the first line of a chat message. The message is HTML, so its text is
+ * escaped: the entities are decoded here, or "Bicep & Soarr" becomes the performer "Bicep &amp; Soarr".
+ */
+fun trackNameFromMessage(message: String): Pair<String, String> =
+    Parser.unescapeEntities(message.lineSequence().first(), false)
+        .stripDisplayDuration()
+        .split2ByDash(reverseIfSingle = true)
 
 fun String.removeFirstLine(): String = this.lineSequence().drop(1).joinToString("\n")
 

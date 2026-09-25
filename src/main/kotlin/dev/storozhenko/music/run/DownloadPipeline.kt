@@ -4,8 +4,7 @@ import dev.storozhenko.music.Quality
 import dev.storozhenko.music.eagerlyDelete
 import dev.storozhenko.music.getLogger
 import dev.storozhenko.music.removeFirstLine
-import dev.storozhenko.music.split2ByDash
-import dev.storozhenko.music.stripDisplayDuration
+import dev.storozhenko.music.trackNameFromMessage
 import dev.storozhenko.music.validateVideoFile
 import dev.storozhenko.music.services.DownloadService
 import dev.storozhenko.music.services.MediaProbeService
@@ -87,7 +86,7 @@ class DownloadPipeline(
                 ?.let { runCatching { processor.convertToSquareThumbnail(it) }.getOrNull() ?: it }
             val duration = probe.getMediaDuration(downloadedFile)
 
-            val (artist, title) = message.lineSequence().first().stripDisplayDuration().split2ByDash(true)
+            val (artist, title) = trackNameFromMessage(message)
             reporter.status("Sending Audio...")
             pulser.set("upload_voice")
             sender.sendAudioInPlace(
@@ -158,7 +157,7 @@ class DownloadPipeline(
             }
             val videoDuration = videoDims.duration
 
-            val (artist, title) = message.lineSequence().first().stripDisplayDuration().split2ByDash(true)
+            val (artist, title) = trackNameFromMessage(message)
             var sendVideo = true
             // A song can hide behind a plain youtube.com link: a still image with audio on an
             // ordinary channel, 16:9 and so indistinguishable by host or aspect ratio. YouTube's own
