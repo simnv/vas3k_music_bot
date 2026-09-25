@@ -1,5 +1,6 @@
 package dev.storozhenko.music.services
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.storozhenko.music.getLogger
 import kotlinx.coroutines.CancellationException
@@ -56,10 +57,10 @@ class MusicResolver(
         val results = coroutineScope {
             // Seed each platform with the posted URL rather than searching for what we were given.
             val apple = async {
-                safe { sourceIfHost(sourceUrl, "apple.com")?.let { appleSourceInOurStorefront(it) } ?: searchApple(query) }
+                safe { sourceIfHost(sourceUrl, "apple.com")?.let { appleSourceInOurStorefront(it) } ?: searchApple(identity) }
             }
-            val yandex = async { safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandex(query) } }
-            val spot = async { safe { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchTrackUrl(query) } }
+            val yandex = async { safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandex(identity) } }
+            val spot = async { safe { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchTrackUrl(identity) } }
             val youtube = async {
                 safe { sourceIfHost(sourceUrl, "youtube.com", "youtu.be") ?: ytSearch(query) }
             }
@@ -124,12 +125,12 @@ class MusicResolver(
 
         val results = coroutineScope {
             val apple = async {
-                safe { sourceIfHost(sourceUrl, "apple.com")?.let { appleSourceInOurStorefront(it) } ?: searchAppleAlbum(identity.query) }
+                safe { sourceIfHost(sourceUrl, "apple.com")?.let { appleSourceInOurStorefront(it) } ?: searchAppleAlbum(identity) }
             }
             val yandex = async {
-                safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandexAlbum(identity.query) }
+                safe { sourceIfHost(sourceUrl, "yandex.ru", "yandex.com") ?: searchYandexAlbum(identity) }
             }
-            val spot = async { safe { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchAlbumUrl(identity.query) } }
+            val spot = async { safe { sourceIfHost(sourceUrl, "spotify.com") ?: spotify?.searchAlbumUrl(identity) } }
             listOf(apple.await(), yandex.await(), spot.await())
         }
         val (apple, yandex, spotifyUrl) = results
@@ -243,30 +244,42 @@ class MusicResolver(
         if (title.isBlank()) null else TrackIdentity(artist, title)
     }.getOrNull()
 
-    internal fun parseYandexAlbumSearch(body: String): String? = runCatching {
-        val hit = mapper.readTree(body).path("result").path("albums").path("results").firstOrNull()
+    internal fun parseYandexAlbumSearch(body: String, wanted: TrackIdentity): String? = runCatching {
+        val hit = mapper.readTree(body).path("result").path("albums").path("results")
+            .firstOrNull { SearchMatch.matches(wanted, it.path("title").asText(""), yandexArtists(it)) }
             ?: return null
         hit.path("id").asText("").takeIf { it.isNotBlank() }?.let { "https://music.yandex.ru/album/$it" }
     }.getOrNull()
 
-    private suspend fun searchAppleAlbum(query: String): String? {
-        val term = encode(query)
+    private fun yandexArtists(node: JsonNode): List<String> =
+        node.path("artists").mapNotNull { a -> a.path("name").asText("").takeIf { it.isNotBlank() } }
+
+    private suspend fun searchAppleAlbum(wanted: TrackIdentity): String? {
+        val term = encode(wanted.query)
         val local = web.get(
-            "https://itunes.apple.com/search?term=$term&entity=album&limit=1&country=$appleStorefront"
-        )?.let { parseItunesAlbumUrl(it) }
+            "https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT&country=$appleStorefront"
+        )?.let { parseItunesAlbumUrl(it, wanted) }
         if (local != null) return local
-        return web.get("https://itunes.apple.com/search?term=$term&entity=album&limit=1")
-            ?.let { parseItunesAlbumUrl(it) }
+        return web.get("https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT")
+            ?.let { parseItunesAlbumUrl(it, wanted) }
     }
 
-    internal fun parseItunesAlbumUrl(body: String): String? = runCatching {
-        mapper.readTree(body).path("results").firstOrNull()
-            ?.path("collectionViewUrl")?.asText("")?.takeIf { it.isNotBlank() }
-    }.getOrNull()
+    internal fun parseItunesAlbumUrl(body: String, wanted: TrackIdentity): String? =
+        parseItunesHit(body, wanted, "collectionName", "collectionViewUrl")
 
-    private suspend fun searchYandexAlbum(query: String): String? =
-        web.get("https://api.music.yandex.net/search?text=${encode(query)}&type=album&page=0", useProxy = true)
-            ?.let { parseYandexAlbumSearch(it) }
+    /** First iTunes result whose [titleField] matches, as its [urlField]. */
+    private fun parseItunesHit(body: String, wanted: TrackIdentity, titleField: String, urlField: String): String? =
+        runCatching {
+            mapper.readTree(body).path("results")
+                .firstOrNull {
+                    SearchMatch.matches(wanted, it.path(titleField).asText(""), listOf(it.path("artistName").asText("")).filter(String::isNotBlank))
+                }
+                ?.path(urlField)?.asText("")?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+
+    private suspend fun searchYandexAlbum(wanted: TrackIdentity): String? =
+        web.get("https://api.music.yandex.net/search?text=${encode(wanted.query)}&type=album&page=0", useProxy = true)
+            ?.let { parseYandexAlbumSearch(it, wanted) }
 
     // ---- stage 1: identify -------------------------------------------------
 
@@ -372,10 +385,8 @@ class MusicResolver(
         if (artist.isBlank() && title.isBlank()) null else TrackIdentity(artist, title)
     }.getOrNull()
 
-    internal fun parseItunesUrl(body: String): String? = runCatching {
-        mapper.readTree(body).path("results").firstOrNull()
-            ?.path("trackViewUrl")?.asText("")?.takeIf { it.isNotBlank() }
-    }.getOrNull()
+    internal fun parseItunesUrl(body: String, wanted: TrackIdentity): String? =
+        parseItunesHit(body, wanted, "trackName", "trackViewUrl")
 
     private suspend fun ogIdentity(url: String, bulletArtist: Boolean): TrackIdentity? =
         web.get(url)?.let { parseOg(it, bulletArtist) }
@@ -413,14 +424,14 @@ class MusicResolver(
      * so a storefront must be chosen. Search the [appleStorefront] first so links open there, and
      * fall back to the default (US) catalogue only when it does not carry the track.
      */
-    private suspend fun searchApple(query: String): String? {
-        val term = encode(query)
+    private suspend fun searchApple(wanted: TrackIdentity): String? {
+        val term = encode(wanted.query)
         val local = web.get(
-            "https://itunes.apple.com/search?term=$term&entity=song&limit=1&country=$appleStorefront"
-        )?.let { parseItunesUrl(it) }
+            "https://itunes.apple.com/search?term=$term&entity=song&limit=$SEARCH_LIMIT&country=$appleStorefront"
+        )?.let { parseItunesUrl(it, wanted) }
         if (local != null) return local
-        return web.get("https://itunes.apple.com/search?term=$term&entity=song&limit=1")
-            ?.let { parseItunesUrl(it) }
+        return web.get("https://itunes.apple.com/search?term=$term&entity=song&limit=$SEARCH_LIMIT")
+            ?.let { parseItunesUrl(it, wanted) }
     }
 
     /**
@@ -429,12 +440,12 @@ class MusicResolver(
      * `api.music.yandex.net` returns HTTP 451 unless the request exits through the SOCKS proxy that
      * already carries VK and RuTube traffic. The old `handlers/music-search.jsx` endpoint is 404.
      */
-    private suspend fun searchYandex(query: String): String? {
+    private suspend fun searchYandex(wanted: TrackIdentity): String? {
         val body = web.get(
-            "https://api.music.yandex.net/search?text=${encode(query)}&type=track&page=0",
+            "https://api.music.yandex.net/search?text=${encode(wanted.query)}&type=track&page=0",
             useProxy = true,
         ) ?: return null
-        return parseYandexSearch(body)
+        return parseYandexSearch(body, wanted)
     }
 
     private suspend fun yandexLookup(url: String): TrackIdentity? {
@@ -454,9 +465,10 @@ class MusicResolver(
         if (title.isBlank()) null else TrackIdentity(artist, title)
     }.getOrNull()
 
-    /** Top search hit, rendered as the canonical `/album/{albumId}/track/{trackId}` web URL. */
-    internal fun parseYandexSearch(body: String): String? = runCatching {
-        val hit = mapper.readTree(body).path("result").path("tracks").path("results").firstOrNull()
+    /** First matching search hit, rendered as the canonical `/album/{albumId}/track/{trackId}` web URL. */
+    internal fun parseYandexSearch(body: String, wanted: TrackIdentity): String? = runCatching {
+        val hit = mapper.readTree(body).path("result").path("tracks").path("results")
+            .firstOrNull { SearchMatch.matches(wanted, it.path("title").asText(""), yandexArtists(it)) }
             ?: return null
         val trackId = hit.path("id").asText("").takeIf { it.isNotBlank() } ?: return null
         val albumId = hit.path("albums").firstOrNull()?.path("id")?.asText("")?.takeIf { it.isNotBlank() }
@@ -465,4 +477,9 @@ class MusicResolver(
     }.getOrNull()
 
     private fun encode(s: String): String = URLEncoder.encode(s, StandardCharsets.UTF_8)
+
+    private companion object {
+        /** Enough hits to get past the wrong ones a search puts first, without paging. */
+        const val SEARCH_LIMIT = 5
+    }
 }

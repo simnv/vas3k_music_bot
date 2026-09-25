@@ -39,14 +39,14 @@ class MusicResolverTest {
         assertEquals(TrackIdentity("BEARWOLF", "Владивосток"), resolver.parseItunes(itunesJson))
         assertEquals(
             "https://music.apple.com/us/album/x/6793443883?i=6793443884&uo=4",
-            resolver.parseItunesUrl(itunesJson),
+            resolver.parseItunesUrl(itunesJson, TrackIdentity("BEARWOLF", "Владивосток")),
         )
     }
 
     @Test
     fun `empty itunes results yield null`() {
         assertNull(resolver.parseItunes("""{"resultCount":0,"results":[]}"""))
-        assertNull(resolver.parseItunesUrl("""{"resultCount":0,"results":[]}"""))
+        assertNull(resolver.parseItunesUrl("""{"resultCount":0,"results":[]}""", TrackIdentity("BEARWOLF", "Владивосток")))
         assertNull(resolver.parseItunes("not json"))
     }
 
@@ -142,14 +142,15 @@ class MusicResolverTest {
 
     @Test
     fun `builds album urls from search results`() {
+        val x = TrackIdentity("", "X")
         assertEquals(
             "https://music.yandex.ru/album/43183857",
-            resolver.parseYandexAlbumSearch("""{"result":{"albums":{"results":[{"id":43183857}]}}}"""),
+            resolver.parseYandexAlbumSearch("""{"result":{"albums":{"results":[{"id":43183857,"title":"X"}]}}}""", x),
         )
-        assertNull(resolver.parseYandexAlbumSearch("""{"result":{"albums":{"results":[]}}}"""))
+        assertNull(resolver.parseYandexAlbumSearch("""{"result":{"albums":{"results":[]}}}""", x))
         assertEquals(
             "https://music.apple.com/ru/album/x/1",
-            resolver.parseItunesAlbumUrl("""{"results":[{"collectionViewUrl":"https://music.apple.com/ru/album/x/1"}]}"""),
+            resolver.parseItunesAlbumUrl("""{"results":[{"collectionName":"X","collectionViewUrl":"https://music.apple.com/ru/album/x/1"}]}""", x),
         )
     }
 
@@ -159,7 +160,7 @@ class MusicResolverTest {
         coEvery { web.get(match { it.contains("api.music.yandex.net/albums") }, any(), any()) } returns
             """{"result":{"title":"Владивосток","artists":[{"name":"BEARWOLF"}]}}"""
         coEvery { web.get(match { it.contains("entity=album") && it.contains("country=gb") }, any(), any()) } returns
-            """{"results":[{"collectionViewUrl":"https://music.apple.com/ru/album/x/1"}]}"""
+            """{"results":[{"collectionName":"Владивосток - Single","artistName":"BEARWOLF","collectionViewUrl":"https://music.apple.com/ru/album/x/1"}]}"""
 
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/should-not-be-used" }).resolveAlbum(source)!!
 
@@ -232,9 +233,9 @@ class MusicResolverTest {
     fun `a youtube album resolves to links and never to a download`() = runTest {
         val source = "https://music.youtube.com/playlist?list=OLAK5uy_abc"
         coEvery { web.get(match { it.contains("entity=album") }, any(), any()) } returns
-            """{"results":[{"collectionViewUrl":"https://music.apple.com/gb/album/x/1"}]}"""
+            """{"results":[{"collectionName":"Anatomy of a Brief Romance","artistName":"Bloc Party","collectionViewUrl":"https://music.apple.com/gb/album/x/1"}]}"""
         coEvery { web.get(match { it.contains("api.music.yandex.net/search") }, any(), any()) } returns
-            """{"result":{"albums":{"results":[{"id":77}]}}}"""
+            """{"result":{"albums":{"results":[{"id":77,"title":"Anatomy Of A Brief Romance","artists":[{"name":"Bloc Party"}]}]}}}"""
 
         val r = MusicResolver(web, ytSearch = { "https://youtu.be/should-not-be-used" })
             .resolveAlbumFor(TrackIdentity("Bloc Party", "Anatomy Of A Brief Romance"), source)!!
@@ -368,8 +369,23 @@ class MusicResolverTest {
 
     @Test
     fun `builds the yandex web url from the search api`() {
-        assertEquals("https://music.yandex.ru/album/43183857/track/153933899", resolver.parseYandexSearch(yandexSearchJson))
-        assertNull(resolver.parseYandexSearch("""{"result":{"tracks":{"results":[]}}}"""))
+        assertEquals("https://music.yandex.ru/album/43183857/track/153933899", resolver.parseYandexSearch(yandexSearchJson, TrackIdentity("BEARWOLF", "Владивосток")))
+        assertNull(resolver.parseYandexSearch("""{"result":{"tracks":{"results":[]}}}""", TrackIdentity("BEARWOLF", "Владивосток")))
+    }
+
+    @Test
+    fun `a search hit for another record is not linked`() {
+        // Captured 2026-09-25: Yandex does not carry this track and put another Polyphia one first.
+        val polyphia = TrackIdentity("Polyphia", "WITH EYES TO SEE")
+        val otherRecords = """
+            {"result":{"tracks":{"results":[
+            {"id":108354245,"title":"Fuck Around and Find Out","artists":[{"name":"Polyphia"},{"name":"${'$'}NOT"}],"albums":[{"id":23891692}]},
+            {"id":1,"title":"Remember That You Will Die","artists":[{"name":"Polyphia"}],"albums":[{"id":2}]}]}}}
+        """.trimIndent()
+        assertNull(resolver.parseYandexSearch(otherRecords, polyphia))
+
+        val rightOneSecond = otherRecords.replace("Remember That You Will Die", "With Eyes To See")
+        assertEquals("https://music.yandex.ru/album/2/track/1", resolver.parseYandexSearch(rightOneSecond, polyphia))
     }
 
     @Test

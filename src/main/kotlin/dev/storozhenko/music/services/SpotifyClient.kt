@@ -110,10 +110,10 @@ class SpotifyClient(
         return parseTrack(body)
     }
 
-    suspend fun searchTrackUrl(query: String, now: Instant = Instant.now()): String? {
-        val encoded = URLEncoder.encode(query, StandardCharsets.UTF_8)
-        val body = apiGet("search?q=$encoded&type=track&limit=1", now) ?: return null
-        return parseSearchUrl(body)
+    suspend fun searchTrackUrl(wanted: TrackIdentity, now: Instant = Instant.now()): String? {
+        val encoded = URLEncoder.encode(wanted.query, StandardCharsets.UTF_8)
+        val body = apiGet("search?q=$encoded&type=track&limit=$SEARCH_LIMIT", now) ?: return null
+        return parseSearchUrl(body, wanted)
     }
 
     suspend fun albumIdentity(albumId: String, now: Instant = Instant.now()): TrackIdentity? {
@@ -121,14 +121,22 @@ class SpotifyClient(
         return parseTrack(body) // albums carry the same name/artists shape
     }
 
-    suspend fun searchAlbumUrl(query: String, now: Instant = Instant.now()): String? {
-        val encoded = URLEncoder.encode(query, StandardCharsets.UTF_8)
-        val body = apiGet("search?q=$encoded&type=album&limit=1", now) ?: return null
-        return parseAlbumSearchUrl(body)
+    suspend fun searchAlbumUrl(wanted: TrackIdentity, now: Instant = Instant.now()): String? {
+        val encoded = URLEncoder.encode(wanted.query, StandardCharsets.UTF_8)
+        val body = apiGet("search?q=$encoded&type=album&limit=$SEARCH_LIMIT", now) ?: return null
+        return parseAlbumSearchUrl(body, wanted)
     }
 
-    internal fun parseAlbumSearchUrl(body: String): String? = runCatching {
-        mapper.readTree(body).path("albums").path("items").firstOrNull()
+    internal fun parseAlbumSearchUrl(body: String, wanted: TrackIdentity): String? =
+        parseHitUrl(body, "albums", wanted)
+
+    /** First item under [kind] that matches [wanted]: search always answers, even without the record. */
+    private fun parseHitUrl(body: String, kind: String, wanted: TrackIdentity): String? = runCatching {
+        mapper.readTree(body).path(kind).path("items")
+            .firstOrNull { item ->
+                val artists = item.path("artists").mapNotNull { a -> a.path("name").asText("").takeIf { it.isNotBlank() } }
+                SearchMatch.matches(wanted, item.path("name").asText(""), artists)
+            }
             ?.path("external_urls")?.path("spotify")?.asText("")?.takeIf { it.isNotBlank() }
     }.getOrNull()
 
@@ -139,8 +147,11 @@ class SpotifyClient(
         if (title.isBlank()) null else TrackIdentity(artist, title)
     }.getOrNull()
 
-    internal fun parseSearchUrl(body: String): String? = runCatching {
-        mapper.readTree(body).path("tracks").path("items").firstOrNull()
-            ?.path("external_urls")?.path("spotify")?.asText("")?.takeIf { it.isNotBlank() }
-    }.getOrNull()
+    internal fun parseSearchUrl(body: String, wanted: TrackIdentity): String? =
+        parseHitUrl(body, "tracks", wanted)
+
+    private companion object {
+        /** Enough hits to get past the wrong ones a search puts first, without paging. */
+        const val SEARCH_LIMIT = 5
+    }
 }
