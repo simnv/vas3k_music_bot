@@ -221,6 +221,14 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `strips the youtube topic channel suffix from the artist`() {
+        // With the suffix left in, Spotify answered "Kilimanjaro" by Superpitcher for this album.
+        assertEquals("Kill Gosling", resolver.cleanYoutubeArtist("Kill Gosling - Topic"))
+        assertEquals("Tom Morello", resolver.cleanYoutubeArtist("Tom Morello"))
+        assertEquals("Topic", resolver.cleanYoutubeArtist("Topic"))
+    }
+
+    @Test
     fun `a youtube album resolves to links and never to a download`() = runTest {
         val source = "https://music.youtube.com/playlist?list=OLAK5uy_abc"
         coEvery { web.get(match { it.contains("entity=album") }, any(), any()) } returns

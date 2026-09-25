@@ -184,6 +184,10 @@ class MusicResolver(
     internal fun cleanYoutubeAlbumTitle(title: String): String =
         title.replace(Regex("^(Album|Single|EP)\\s+-\\s+", RegexOption.IGNORE_CASE), "").trim()
 
+    /** Strips the " - Topic" suffix of the auto-generated YouTube channels that upload releases. */
+    internal fun cleanYoutubeArtist(uploader: String): String =
+        uploader.replace(Regex("\\s+-\\s+Topic$", RegexOption.IGNORE_CASE), "").trim()
+
     fun isPlaylistUrl(url: String): Boolean = runCatching {
         val host = URI(url).host?.lowercase() ?: return false
         val path = urlPath(url) ?: return false

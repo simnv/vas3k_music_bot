@@ -385,7 +385,10 @@ class Bot(
             onDetected()
             val meta = downloader.getPlaylistMeta(ytAlbumUrl)
             val identity = meta?.let {
-                TrackIdentity(it.uploader.orEmpty(), musicResolver.cleanYoutubeAlbumTitle(it.title))
+                TrackIdentity(
+                    musicResolver.cleanYoutubeArtist(it.uploader.orEmpty()),
+                    musicResolver.cleanYoutubeAlbumTitle(it.title),
+                )
             } ?: TrackIdentity("", "")
             val album = musicResolver.resolveAlbumFor(identity, ytAlbumUrl)
             return if (album != null) {
