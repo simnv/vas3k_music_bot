@@ -78,7 +78,9 @@ class MediaProbeService(private val virtualDispatcher: CoroutineDispatcher) {
             "ffmpeg", "-v", "error",
             "-ss", startTime.toString(), "-t", duration.toString(),
             "-i", videoFile.absolutePath,
-            "-vf", "freezedetect=n=-30dB:d=1,metadata=mode=print:file=-",
+            // -30dB read a fixed-camera talk as frozen. Measured 5x5s ratios on real uploads:
+            // still-image tracks 0.98-1.00 at -50dB, the talk 0.08; at -60dB a Topic track fell to 0.77.
+            "-vf", "freezedetect=n=-50dB:d=1,metadata=mode=print:file=-",
             "-map", "0:v:0", "-f", "null", "-"
         )
         logger.info(command.shellJoin())

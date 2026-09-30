@@ -61,6 +61,24 @@ class MediaProbeServiceTest {
         )
     }
 
+    /**
+     * A fixed camera on someone talking: no cuts, and only a small area moves. A Joe Rogan clip of
+     * Roger Waters read as 100% frozen at `freezedetect=n=-30dB` and was sent as audio.
+     */
+    private fun talkingHeadClip(dir: File) = File(dir, "head.mp4").also {
+        ffmpeg(
+            "-f", "lavfi", "-i", "color=c=black:s=160x120:r=10:d=20",
+            "-vf", "geq=lum='if(lt(hypot(X-80-6*sin(T*4),Y-50),14),190,40)':cb=128:cr=128",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", it.absolutePath,
+        )
+    }
+
+    @Test
+    fun `a fixed camera with small movement is sent as video`(@TempDir dir: File) = runTest {
+        assumeTrue(toolsAvailable(), "ffmpeg/ffprobe with libx264 not on PATH")
+        assertTrue(probe.decideSendAsVideo(talkingHeadClip(dir), 20))
+    }
+
     @Test
     fun `static cover art is sent as audio`(@TempDir dir: File) = runTest {
         assumeTrue(toolsAvailable(), "ffmpeg/ffprobe with libx264 not on PATH")
