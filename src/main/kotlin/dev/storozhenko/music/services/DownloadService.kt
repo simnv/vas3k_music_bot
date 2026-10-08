@@ -8,6 +8,8 @@ import dev.storozhenko.music.shellJoin
 import dev.storozhenko.music.validateThumbnailFile
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
@@ -15,12 +17,21 @@ import kotlinx.coroutines.runInterruptible
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 
 data class VideoMeta(val title: String, val durationSec: Int?)
 
 /** Playlist-level metadata, read without resolving every entry. */
 data class PlaylistMeta(val title: String, val uploader: String?, val count: Int?)
+
+/**
+ * A YouTube Music release as a search answers it: the playlist to link to, plus the name and
+ * artist to check it against. Titles arrive prefixed ("Album - WOOF.") and artists come from the
+ * auto-generated upload channel ("Fat Dog - Topic"), so both need cleaning before a comparison.
+ */
+data class YtMusicAlbum(val playlistId: String, val title: String, val artist: String?)
 
 class DownloadService(
     private val ytdlLocation: String,
@@ -41,7 +52,15 @@ class DownloadService(
 
     private companion object {
         const val MAX_INFO_JSON_BYTES = 8L * 1024 * 1024
+
+        /**
+         * Album hits opened per search. Each is one request, and YouTube Music ranks the wanted
+         * release within the first few — for "Fat Dog Cancel Me" it came second.
+         */
+        const val YT_MUSIC_ALBUM_CANDIDATES = 3
     }
+
+    private fun urlEncode(s: String): String = URLEncoder.encode(s, StandardCharsets.UTF_8)
 
     private fun getIpVersionParam(url: String): String? {
         if (ipv6UrlContains.isNullOrEmpty()) return null
@@ -248,6 +267,56 @@ class DownloadService(
             uploader = parts.getOrNull(1)?.takeIf { it.isNotBlank() && it != "NA" },
             count = parts.getOrNull(2)?.toIntOrNull(),
         )
+    }
+
+    /**
+     * Releases YouTube Music offers for a query, in its own ranking order.
+     *
+     * Needs the cookie jar. A session-less client is served no catalog at all: the same search
+     * answers "No results" anonymously, which is why album answers used to carry no YouTube link.
+     *
+     * Two steps, because the search yields only opaque MPREb_ browse ids — each has to be opened
+     * to learn its playlist and its name.
+     */
+    suspend fun ytMusicAlbums(query: String, limit: Int = YT_MUSIC_ALBUM_CANDIDATES): List<YtMusicAlbum> {
+        val browseUrls = ytMusicAlbumBrowseUrls(query, limit)
+        if (browseUrls.isEmpty()) return emptyList()
+        // Opened together: they are independent, and in series the waits would add up.
+        return coroutineScope { browseUrls.map { async { ytMusicAlbumAt(it) } }.awaitAll() }.filterNotNull()
+    }
+
+    private suspend fun ytMusicAlbumBrowseUrls(query: String, limit: Int): List<String> =
+        runInterruptible(virtualDispatcher) {
+            // The section is selected by the URL fragment, which is yt-dlp's own convention here.
+            val searchUrl = "https://music.youtube.com/search?q=${urlEncode(query)}#albums"
+            val command = listOf(
+                ytdlLocation, "--cookies", "/cookies.txt",
+                "--flat-playlist", "--playlist-items", "1:$limit", "--skip-download", "--no-warnings",
+                "--print", "%(url)s", searchUrl,
+            )
+            logger.info(command.shellJoin())
+            val process = ProcessBuilder(command).redirectErrorStream(true).start()
+            val lines = BufferedReader(InputStreamReader(process.inputStream)).use { it.readLines() }
+            process.waitFor()
+            val urls = lines.filter { it.startsWith("https://music.youtube.com/browse/") }
+            logger.info("YouTube Music albums for '$query': ${urls.size} candidates")
+            urls
+        }
+
+    private suspend fun ytMusicAlbumAt(browseUrl: String): YtMusicAlbum? = runInterruptible(virtualDispatcher) {
+        // One entry is enough: the fields wanted describe the playlist, not the track.
+        val command = listOf(
+            ytdlLocation, "--cookies", "/cookies.txt",
+            "--flat-playlist", "--playlist-items", "1", "--skip-download", "--no-warnings",
+            "--print", "%(playlist_id)s\t%(playlist_title)s\t%(uploader)s", browseUrl,
+        )
+        val process = ProcessBuilder(command).redirectErrorStream(true).start()
+        val lines = BufferedReader(InputStreamReader(process.inputStream)).use { it.readLines() }
+        process.waitFor()
+        val parts = (lines.firstOrNull { it.contains('\t') } ?: return@runInterruptible null).split("\t")
+        val id = parts.getOrNull(0)?.takeIf { it.isNotBlank() && it != "NA" } ?: return@runInterruptible null
+        val title = parts.getOrNull(1)?.takeIf { it.isNotBlank() && it != "NA" } ?: return@runInterruptible null
+        YtMusicAlbum(id, title, parts.getOrNull(2)?.takeIf { it.isNotBlank() && it != "NA" })
     }
 
     suspend fun getVideoMeta(url: String): VideoMeta = runInterruptible(virtualDispatcher) {

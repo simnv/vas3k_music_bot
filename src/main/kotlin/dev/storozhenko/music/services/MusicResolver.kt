@@ -39,6 +39,8 @@ class MusicResolver(
     private val ytSearch: suspend (String) -> String?,
     private val spotify: SpotifyClient? = null,
     private val appleStorefront: String = "gb",
+    /** Album hits for a query, ranked by YouTube Music. Empty when it is not reachable. */
+    private val ytAlbumSearch: suspend (String) -> List<YtMusicAlbum> = { emptyList() },
 ) {
     private val logger = getLogger()
     private val mapper = ObjectMapper()
@@ -141,9 +143,39 @@ class MusicResolver(
         spotifyUrl?.let { links["Spotify"] = it }
         // The posted link belongs in the list too when no search covered its own service.
         serviceName(sourceUrl)?.let { links.putIfAbsent(it, sourceUrl) }
+        if (links.keys.none { it.startsWith("YouTube") }) {
+            val found = safe { ytMusicAlbumUrl(identity, ytAlbumSearch(identity.query)) }
+            if (found != null) links["YouTube Music"] = found
+            // Last, because it is a query rather than a release.
+            else ytMusicAlbumSearchUrl(identity)?.let { links["YouTube Music search"] = it }
+        }
         if (links.isEmpty()) return sourceOnly(sourceUrl)
         return ResolvedTrack(identity, links, youtubeUrl = null)
     }
+
+    /**
+     * The first hit that is actually the release we asked for. Ranking alone would be wrong:
+     * searching "Fat Dog Cancel Me" put their earlier "WOOF." first and the wanted record second.
+     */
+    internal fun ytMusicAlbumUrl(wanted: TrackIdentity, hits: List<YtMusicAlbum>): String? = hits
+        .firstOrNull { hit ->
+            SearchMatch.matches(
+                wanted,
+                cleanYoutubeAlbumTitle(hit.title),
+                listOfNotNull(hit.artist?.let { cleanYoutubeArtist(it) }).filter(String::isNotBlank),
+            )
+        }
+        ?.playlistId?.takeIf { it.isNotBlank() }
+        ?.let { "https://music.youtube.com/playlist?list=$it" }
+
+    /**
+     * A query page, used when the catalog gave us no release of that name — including when the
+     * cookie jar has gone stale, since YouTube Music serves no catalog at all to a session-less
+     * client. The query lands one click from the album and can never name the wrong record.
+     */
+    internal fun ytMusicAlbumSearchUrl(identity: TrackIdentity): String? =
+        identity.query.takeIf { it.isNotBlank() }
+            ?.let { "https://music.youtube.com/search?q=${encode(it)}" }
 
     /** Last resort: the link we were given, labelled with its own service. */
     private fun sourceOnly(sourceUrl: String): ResolvedTrack? {
@@ -260,9 +292,40 @@ class MusicResolver(
             "https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT&country=$appleStorefront"
         )?.let { parseItunesAlbumUrl(it, wanted) }
         if (local != null) return local
-        return web.get("https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT")
+        val global = web.get("https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT")
             ?.let { parseItunesAlbumUrl(it, wanted) }
+        return global ?: appleAlbumFromArtistCatalog(wanted)
     }
+
+    /**
+     * The iTunes *search* index is missing records the catalog carries. It answered every phrasing
+     * of Fat Dog's "Cancel Me (I'm Tired)" with resultCount 0, and their 2024 "WOOF." too, while a
+     * lookup of the same artist returned both. Searching for the artist alone does work, so the
+     * album is found by reading that artist's releases instead.
+     */
+    private suspend fun appleAlbumFromArtistCatalog(wanted: TrackIdentity): String? {
+        if (wanted.artist.isBlank()) return null
+        val body = web.get(
+            "https://itunes.apple.com/search?term=${encode(wanted.artist)}" +
+                "&entity=musicArtist&limit=$SEARCH_LIMIT&country=$appleStorefront"
+        ) ?: return null
+        // A name is not unique — five artists answer to "Fat Dog". Try the ones actually called
+        // that, in the order Apple ranked them, and stop at the first catalog holding the album.
+        return parseItunesArtistIds(body)
+            .take(ARTIST_CATALOGS)
+            .firstNotNullOfOrNull { id ->
+                web.get(
+                    "https://itunes.apple.com/lookup?id=$id&entity=album" +
+                        "&limit=$ARTIST_CATALOG_SIZE&country=$appleStorefront"
+                )?.let { parseItunesAlbumUrl(it, wanted) }
+            }
+    }
+
+    /** Artist ids from an `entity=musicArtist` search, ranked as Apple returned them. */
+    internal fun parseItunesArtistIds(body: String): List<String> = runCatching {
+        mapper.readTree(body).path("results")
+            .mapNotNull { it.path("artistId").asText("").takeIf(String::isNotBlank) }
+    }.getOrElse { emptyList() }
 
     internal fun parseItunesAlbumUrl(body: String, wanted: TrackIdentity): String? =
         parseItunesHit(body, wanted, "collectionName", "collectionViewUrl")
@@ -481,5 +544,11 @@ class MusicResolver(
     private companion object {
         /** Enough hits to get past the wrong ones a search puts first, without paging. */
         const val SEARCH_LIMIT = 5
+
+        /** Catalogs read when a name is shared, one request each, so kept well under SEARCH_LIMIT. */
+        const val ARTIST_CATALOGS = 3
+
+        /** Releases per catalog. Apple defaults to 50; a long discography needs more. */
+        const val ARTIST_CATALOG_SIZE = 200
     }
 }

@@ -113,6 +113,7 @@ class Bot(
             web = WebFetcher(virtualDispatcher, socksProxy = ytdlProxy),
             ytSearch = { query -> downloader.ytSearchFirst(query) },
             spotify = spotify,
+            ytAlbumSearch = { query -> downloader.ytMusicAlbums(query) },
         )
         logger.info("Odesli ${if (odesilService.enabled) "enabled" else "disabled (no ODESLI_API_KEY)"}")
     }

@@ -503,6 +503,155 @@ class MusicResolverTest {
         assertTrue(!r.links.containsKey("Apple Music"))
     }
 
+    // ---- apple: the search index misses releases the catalog has --------------
+
+    private val itunesNoAlbums = """{"resultCount":0,"results":[]}"""
+
+    private val itunesArtists = """
+        {"resultCount":2,"results":[
+        {"wrapperType":"artist","artistId":1696953372,"artistName":"Fat Dog"},
+        {"wrapperType":"artist","artistId":1515676139,"artistName":"Fat Dog"}]}
+    """.trimIndent()
+
+    private val itunesArtistAlbums = """
+        {"resultCount":3,"results":[
+        {"wrapperType":"artist","artistId":1696953372,"artistName":"Fat Dog"},
+        {"wrapperType":"collection","artistName":"Fat Dog","collectionName":"WOOF.",
+        "collectionViewUrl":"https://music.apple.com/gb/album/woof/1738213012?uo=4"},
+        {"wrapperType":"collection","artistName":"Fat Dog","collectionName":"Cancel Me (I'm Tired)",
+        "collectionViewUrl":"https://music.apple.com/gb/album/cancel-me-im-tired/6774692705?uo=4"}]}
+    """.trimIndent()
+
+    @Test
+    fun `reads the artist ids out of an itunes artist search`() {
+        assertEquals(listOf("1696953372", "1515676139"), resolver.parseItunesArtistIds(itunesArtists))
+        assertEquals(emptyList(), resolver.parseItunesArtistIds(itunesNoAlbums))
+        assertEquals(emptyList(), resolver.parseItunesArtistIds("not json"))
+    }
+
+    @Test
+    fun `an album the itunes search cannot find is taken from the artist catalog`() = runTest {
+        // Real case: Fat Dog's "Cancel Me (I'm Tired)" is on Apple Music, but the iTunes search
+        // endpoint answers every phrasing of it with resultCount 0. Lookup by artist returns it.
+        val wanted = TrackIdentity("Fat Dog", "Cancel Me (I'm Tired)")
+        coEvery { web.get(match { it.contains("entity=album") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("entity=musicArtist") }, any(), any()) } returns itunesArtists
+        coEvery { web.get(match { it.contains("/lookup?id=1696953372") }, any(), any()) } returns itunesArtistAlbums
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val r = resolver.resolveAlbumFor(wanted, "https://open.spotify.com/album/74vQ5qdsnCnKnTS9Xmv8il")!!
+        assertEquals("https://music.apple.com/gb/album/cancel-me-im-tired/6774692705?uo=4", r.links["Apple Music"])
+    }
+
+    @Test
+    fun `the artist catalog is not consulted for an album we cannot name an artist for`() = runTest {
+        coEvery { web.get(match { it.contains("entity=album") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val r = resolver.resolveAlbumFor(
+            TrackIdentity("", "Cancel Me (I'm Tired)"),
+            "https://open.spotify.com/album/74vQ5qdsnCnKnTS9Xmv8il",
+        )!!
+        // No artist means no way to pick a catalog, and a bare title search is what already failed.
+        assertNull(r.links["Apple Music"])
+    }
+
+    @Test
+    fun `a catalog that does not carry the album yields no apple link`() = runTest {
+        val wanted = TrackIdentity("Fat Dog", "Some Record They Never Made")
+        coEvery { web.get(match { it.contains("entity=album") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("entity=musicArtist") }, any(), any()) } returns itunesArtists
+        coEvery { web.get(match { it.contains("/lookup?id=") }, any(), any()) } returns itunesArtistAlbums
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val r = resolver.resolveAlbumFor(wanted, "https://open.spotify.com/album/74vQ5qdsnCnKnTS9Xmv8il")!!
+        assertNull(r.links["Apple Music"])
+    }
+
+    // ---- youtube music: albums get a query, never a guessed release ----------
+
+    /** What yt-dlp prints for the top album hits of "Fat Dog Cancel Me", captured on 2026-10-08. */
+    private val ytAlbumHits = listOf(
+        YtMusicAlbum("OLAK5uy_other", "Album - WOOF.", "Fat Dog"),
+        YtMusicAlbum("OLAK5uy_nrfPQ", "Album - Cancel Me (I'm Tired)", "Fat Dog - Topic"),
+    )
+
+    private fun resolverWith(albums: List<YtMusicAlbum>) =
+        MusicResolver(web, ytSearch = { null }, ytAlbumSearch = { albums })
+
+    @Test
+    fun `an album is linked to its own youtube music playlist`() = runTest {
+        coEvery { web.get(match { it.contains("itunes.apple.com") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val r = resolverWith(ytAlbumHits).resolveAlbumFor(
+            TrackIdentity("Fat Dog", "Cancel Me (I'm Tired)"),
+            "https://open.spotify.com/album/74vQ5qdsnCnKnTS9Xmv8il",
+        )!!
+        // The ranked-first hit is another record by the same artist, so position cannot be trusted.
+        assertEquals("https://music.youtube.com/playlist?list=OLAK5uy_nrfPQ", r.links["YouTube Music"])
+        assertFalse(r.links.containsKey("YouTube Music search"))
+    }
+
+    @Test
+    fun `an album missing from youtube music falls back to the search link`() = runTest {
+        coEvery { web.get(match { it.contains("itunes.apple.com") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val r = resolverWith(listOf(YtMusicAlbum("OLAK5uy_other", "Album - WOOF.", "Fat Dog")))
+            .resolveAlbumFor(
+                TrackIdentity("Fat Dog", "Cancel Me (I'm Tired)"),
+                "https://open.spotify.com/album/74vQ5qdsnCnKnTS9Xmv8il",
+            )!!
+        assertFalse(r.links.containsKey("YouTube Music"))
+        assertTrue(r.links.containsKey("YouTube Music search"))
+    }
+
+    @Test
+    fun `a youtube music album hit is matched after its prefix and topic suffix are stripped`() {
+        val wanted = TrackIdentity("Fat Dog", "Cancel Me (I'm Tired)")
+        assertEquals(
+            "https://music.youtube.com/playlist?list=OLAK5uy_nrfPQ",
+            resolver.ytMusicAlbumUrl(wanted, ytAlbumHits),
+        )
+        assertNull(resolver.ytMusicAlbumUrl(wanted, emptyList()))
+        // A release whose id did not come through is unlinkable.
+        assertNull(resolver.ytMusicAlbumUrl(wanted, listOf(YtMusicAlbum("", "Album - Cancel Me (I'm Tired)", "Fat Dog"))))
+    }
+
+    @Test
+    fun `an album from another service gets a youtube music search link`() = runTest {
+        coEvery { web.get(match { it.contains("itunes.apple.com") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val r = resolver.resolveAlbumFor(
+            TrackIdentity("Fat Dog", "Cancel Me (I'm Tired)"),
+            "https://open.spotify.com/album/74vQ5qdsnCnKnTS9Xmv8il",
+        )!!
+        assertEquals(
+            "https://music.youtube.com/search?q=Fat+Dog+Cancel+Me+%28I%27m+Tired%29",
+            r.links["YouTube Music search"],
+        )
+        // It goes last, after every service that answered with an actual release.
+        assertEquals("YouTube Music search", r.links.keys.last())
+    }
+
+    @Test
+    fun `a posted youtube music album is not followed by a search for itself`() = runTest {
+        coEvery { web.get(match { it.contains("itunes.apple.com") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val source = "https://music.youtube.com/playlist?list=OLAK5uy_abc"
+        val r = resolver.resolveAlbumFor(TrackIdentity("Fat Dog", "Cancel Me (I'm Tired)"), source)!!
+        assertEquals(source, r.links["YouTube Music"])
+        assertFalse(r.links.containsKey("YouTube Music search"))
+    }
+
+    @Test
+    fun `an unnamed album gets no youtube search link`() {
+        assertNull(resolver.ytMusicAlbumSearchUrl(TrackIdentity("", "")))
+    }
+
     @Test
     fun `a failing youtube search does not sink the whole resolution`() = runTest {
         val source = "https://music.yandex.ru/album/1/track/2"
