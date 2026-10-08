@@ -292,9 +292,12 @@ class MusicResolver(
             "https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT&country=$appleStorefront"
         )?.let { parseItunesAlbumUrl(it, wanted) }
         if (local != null) return local
-        val global = web.get("https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT")
+        // Before the worldwide search, because this one answers from our own store. A link into a
+        // store the listener is not in opens on "This album is not available in your country".
+        appleAlbumFromArtistCatalog(wanted)?.let { return it }
+        return web.get("https://itunes.apple.com/search?term=$term&entity=album&limit=$SEARCH_LIMIT")
             ?.let { parseItunesAlbumUrl(it, wanted) }
-        return global ?: appleAlbumFromArtistCatalog(wanted)
+            ?.let { appleSourceInOurStorefront(it) }
     }
 
     /**
@@ -493,8 +496,10 @@ class MusicResolver(
             "https://itunes.apple.com/search?term=$term&entity=song&limit=$SEARCH_LIMIT&country=$appleStorefront"
         )?.let { parseItunesUrl(it, wanted) }
         if (local != null) return local
+        // A worldwide hit names some other store. Move it to ours when ours carries it too.
         return web.get("https://itunes.apple.com/search?term=$term&entity=song&limit=$SEARCH_LIMIT")
             ?.let { parseItunesUrl(it, wanted) }
+            ?.let { appleSourceInOurStorefront(it) }
     }
 
     /**

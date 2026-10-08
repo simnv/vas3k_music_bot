@@ -94,6 +94,38 @@ class MusicResolverTest {
     }
 
     @Test
+    fun `a storefront hit beats one from the worldwide catalogue`() = runTest {
+        // Both can answer. The worldwide search returns whichever store has it, and a link into a
+        // store the listener is not in renders as "not available in your country or region".
+        val wanted = TrackIdentity("Fat Dog", "Cancel Me (I'm Tired)")
+        coEvery { web.get(match { it.contains("entity=album") && it.contains("country=gb") }, any(), any()) } returns itunesNoAlbums
+        coEvery { web.get(match { it.contains("entity=musicArtist") }, any(), any()) } returns itunesArtists
+        coEvery { web.get(match { it.contains("/lookup?id=1696953372") }, any(), any()) } returns itunesArtistAlbums
+        coEvery { web.get(match { it.contains("entity=album") && !it.contains("country=") }, any(), any()) } returns
+            itunesArtistAlbums.replace("/gb/", "/jp/")
+        coEvery { web.get(match { it.contains("api.music.yandex.net") }, any(), any()) } returns null
+
+        val r = resolver.resolveAlbumFor(wanted, "https://open.spotify.com/album/74vQ5qdsnCnKnTS9Xmv8il")!!
+        assertEquals("https://music.apple.com/gb/album/cancel-me-im-tired/6774692705?uo=4", r.links["Apple Music"])
+    }
+
+    @Test
+    fun `a worldwide hit is moved into our storefront when it is carried there`() = runTest {
+        val source = "https://music.yandex.ru/album/43183857/track/153933899"
+        coEvery { web.get(match { it.contains("api.music.yandex.net/tracks") }, any(), any()) } returns yandexTrackJson
+        coEvery { web.get(match { it.contains("/search") && it.contains("country=gb") }, any(), any()) } returns
+            """{"resultCount":0,"results":[]}"""
+        coEvery {
+            web.get(match { it.startsWith("https://itunes.apple.com/search") && !it.contains("country=") }, any(), any())
+        } returns itunesJson
+        // The release is in our store too; the search just did not surface it there.
+        coEvery { web.get(match { it.contains("/lookup?id=") && it.contains("country=gb") }, any(), any()) } returns itunesJson
+
+        val r = MusicResolver(web, ytSearch = { null }).resolve(source)!!
+        assertTrue(r.links["Apple Music"]!!.contains("/gb/"), "expected the link moved to gb")
+    }
+
+    @Test
     fun `resolveFor looks up a source we can already name`() = runTest {
         // A YouTube link in a music chat: yt-dlp gave us the title, so there is nothing to identify.
         val source = "https://youtu.be/G0qpZMFNthk"
