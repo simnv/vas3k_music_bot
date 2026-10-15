@@ -41,6 +41,23 @@ class UtilsTest {
     }
 
     @Test
+    fun `skip at either end of the message`() {
+        assertTrue(parseRequestOptions("https://youtu.be/x skip").skip)
+        assertTrue(parseRequestOptions("skip https://youtu.be/x").skip)
+        assertTrue(parseRequestOptions("https://youtu.be/x audio skip").skip)
+        assertTrue(parseRequestOptions("SKIP https://youtu.be/x").skip)
+        assertFalse(parseRequestOptions("https://youtu.be/x").skip)
+    }
+
+    @Test
+    fun `skip in the middle of a sentence is just a word`() {
+        // Being ignored is a silent outcome: with nothing posted back, a message skipped by
+        // accident reads as the bot being broken. So the word only counts where it is a request.
+        assertFalse(parseRequestOptions("you can skip ahead on https://youtu.be/x").skip)
+        assertFalse(parseRequestOptions("https://youtu.be/x skip the intro").skip)
+    }
+
+    @Test
     fun `empty text gives defaults`() {
         assertEquals(RequestOptions(Quality.HIGH, false), parseRequestOptions(""))
     }

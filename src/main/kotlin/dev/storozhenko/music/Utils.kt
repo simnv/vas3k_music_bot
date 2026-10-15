@@ -62,6 +62,8 @@ data class RequestOptions(
     val forceAudio: Boolean,
     val forceVideo: Boolean = false,
     val qualityExplicit: Boolean = false,
+    /** Leave the message alone entirely: no download, no links, no reply. */
+    val skip: Boolean = false,
 )
 
 fun parseRequestOptions(text: String): RequestOptions {
@@ -71,6 +73,7 @@ fun parseRequestOptions(text: String): RequestOptions {
     var quality: Quality? = null
     var forceAudio = false
     var forceVideo = false
+    var skip = false
     tokens.forEachIndexed { i, raw ->
         val tok = raw.lowercase()
         val atBoundary = i == 0 || i == lastIdx
@@ -92,9 +95,17 @@ fun parseRequestOptions(text: String): RequestOptions {
         if (!forceVideo) {
             forceVideo = tok == "video" || tok == "vid" || (atBoundary && tok == "v")
         }
+        // Only at a boundary, unlike the other words. Mistaking "skip" in a sentence for a request
+        // leaves no trace at all — the bot simply says nothing, which reads as it being broken.
+        if (!skip) {
+            skip = atBoundary && tok == "skip"
+        }
     }
     // `quality` defaults to HIGH when absent, so it can't tell "typed high" from "typed nothing".
-    return RequestOptions(quality ?: Quality.HIGH, forceAudio, forceVideo, qualityExplicit = quality != null)
+    return RequestOptions(
+        quality ?: Quality.HIGH, forceAudio, forceVideo,
+        qualityExplicit = quality != null, skip = skip,
+    )
 }
 
 /**

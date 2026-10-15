@@ -229,6 +229,11 @@ class Bot(
         val chatId = update.message.chatId
         val validLinks = urlEntities.filter { entity -> urlValidator.isValidDownloadUrl(entity.text) }
         val options = parseRequestOptions(update.message.text)
+        // Before the pulser and the job registration, so the message leaves no trace at all.
+        if (options.skip) {
+            logger.info("Skip requested, leaving message ${update.message.messageId} alone")
+            return
+        }
         val quality = options.quality
         val prefetchUrl = validLinks.firstOrNull()?.text
 
